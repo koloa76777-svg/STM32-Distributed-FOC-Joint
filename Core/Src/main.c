@@ -33,6 +33,12 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 #define SQRT3_2   0.86602540378f   // √3/2,逆Clark用
+#define ADC_VREF      3.3f
+#define ADC_RES       4096.0f
+#define INA_GAIN      50.0f
+#define R_SHUNT       0.01f
+// 码值差 → 安培: (raw - offset) * Vref / 4096 / (Gain * Rshunt)
+#define ADC_TO_AMP(raw, off)  (((float)(raw) - (off)) * ADC_VREF / ADC_RES / (INA_GAIN * R_SHUNT))
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -41,6 +47,9 @@
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+ADC_HandleTypeDef hadc1;
+DMA_HandleTypeDef hdma_adc1;
+
 SPI_HandleTypeDef hspi1;
 
 TIM_HandleTypeDef htim2;
@@ -61,15 +70,20 @@ volatile float Uc_dbg = 0.0f;
 volatile uint8_t sector_dbg = 0;
 volatile float theta_offset = 0.0f;   // 编码器零位偏移(校准得到)
 volatile float theta_e_global = 0.0f;   // 主循环更新,中断使用
+uint16_t adc_buf[2];        // DMA 接收缓冲: [0]=A相(IN0/PA0), [1]=B相(IN4/PA4)
+float offset_A = 0, offset_B = 0;   // 提全局,FOC中断里换算电流要用
+float i_a = 0, i_b = 0, i_c = 0;    // 三相电流(安培),给VOFA看
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
 static void MX_TIM2_Init(void);
 static void MX_TIM3_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_SPI1_Init(void);
+static void MX_ADC1_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -229,19 +243,46 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_TIM2_Init();
   MX_TIM3_Init();
   MX_USART2_UART_Init();
   MX_SPI1_Init();
+  MX_ADC1_Init();
   /* USER CODE BEGIN 2 */
-  // 使能 L6234 驱动芯片（拉高 EN_GATE）
-  HAL_GPIO_WritePin(EN_GATE_GPIO_Port, EN_GATE_Pin, GPIO_PIN_SET);
-  HAL_Delay(10);  // 等 L6234 启动稳定
+  HAL_Delay(200);          // 等 200ms,让 3.3V/VREF/INA 供电稳定
+  // ======== 第一步:电流零偏校准(必须在任何通电动作之前)========
+  HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc_buf, 2);
+
+  HAL_GPIO_WritePin(EN_GATE_GPIO_Port, EN_GATE_Pin, GPIO_PIN_RESET);  // EN 拉低,无电流
+  HAL_Delay(50);
   // PWM 启动顺序：先启 Slave，再启 Master
   // 原因：Slave 等触发才走，先启 Slave 让它"待命"，再启 Master 同步开闸
   HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_3);
   HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
   HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2);
+  offset_A = 0;        // ← 删掉 float,否则新建局部变量遮蔽全局
+  offset_B = 0;
+  float sum_A = 0, sum_B = 0;
+//  for (int i = 0; i < 1000; i++) {
+//      HAL_ADC_Start(&hadc1);
+//      HAL_Delay(1);
+//      sum_A += adc_buf[0];
+//      sum_B += adc_buf[1];
+//  }
+  // 校准循环改成同样的轮询读法
+  for (int i = 0; i < 1000; i++) {
+      HAL_Delay(1);              // 等DMA刷新(TRGO每PWM周期都在触发)
+      sum_A += adc_buf[0];
+      sum_B += adc_buf[1];
+  }
+  offset_A = sum_A / 1000.0f;
+  offset_B = sum_B / 1000.0f;
+  printf("offset: %.1f, %.1f\n", offset_A, offset_B);
+  // 使能 L6234 驱动芯片（拉高 EN_GATE）
+  HAL_GPIO_WritePin(EN_GATE_GPIO_Port, EN_GATE_Pin, GPIO_PIN_SET);
+  HAL_Delay(10);  // 等 L6234 启动稳定
+
   // ★Step6: 编码器零位校准(必须在开中断前,避免虚拟theta干扰)
   Uq_cmd = 0.0f;        // 确保校准时无杂散指令
   Ud_cmd = 0.0f;
@@ -252,30 +293,74 @@ int main(void)
 
   // 启动 TIM3 Update 中断
   __HAL_TIM_ENABLE_IT(&htim3, TIM_IT_UPDATE);
-  // 占空比测试（50% = 1.65V 平均电压）
-  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, 900);
-  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, 900);
-  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_3, 900);
+//  // 占空比测试（50% = 1.65V 平均电压）
+//  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, 900);
+//  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, 900);
+//  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_3, 900);
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-  float theta = 0.0f;                  // 虚拟电角度
-  float theta_increment = 0.0001f;     // 每个循环增加的角度（控制转速）
-  uint32_t print_counter = 0;
+
   while (1)
   {
-	    Uq_cmd = 2.0f;   // 先0,验证
+//	    Uq_cmd = 1.0f;   // 先0,验证
+//
+//	    // 主循环读编码器,算电角度,存全局给中断用
+//	    uint16_t raw = AS5047_ReadAngle();
+//	    float theta_m = (float)raw / 16384.0f * TWO_PI;
+////	    float theta_e = (theta_offset - theta_m) * POLE_PAIRS;
+//	    float theta_e = (theta_m - theta_offset) * POLE_PAIRS;  // 反过来试
+//	    theta_e = fmodf(theta_e, TWO_PI);
+//	    if (theta_e < 0) theta_e += TWO_PI;
+//	    theta_e_global = theta_e;   // 更新给中断
+//	    theta_e_global = 1.57f;   // 固定电角度=0,中断读这个跑SVPWM
+//	    Uq_cmd = 2.0f;           // 小Uq,产生稳定电流
+//	    Ud_cmd = 0.0f;
+//
+//	    // 临时:同时打印原始码值和换算电流
+//	    HAL_Delay(50);
+//	    printf("raw:%d,%d\n", adc_buf[0], adc_buf[1]);
 
-	    // 主循环读编码器,算电角度,存全局给中断用
-	    uint16_t raw = AS5047_ReadAngle();
-	    float theta_m = (float)raw / 16384.0f * TWO_PI;
-//	    float theta_e = (theta_offset - theta_m) * POLE_PAIRS;
-	    float theta_e = (theta_m - theta_offset) * POLE_PAIRS;  // 反过来试
-	    theta_e = fmodf(theta_e, TWO_PI);
-	    if (theta_e < 0) theta_e += TWO_PI;
-	    theta_e_global = theta_e;   // 更新给中断
+//	    theta_e_global = 0.0f;
+//	    Uq_cmd = 1.0f;
+//	    Ud_cmd = 0.0f;
+//
+//	    // 标准轮询读法:启动 → 等完成 → 读
+//	    HAL_ADC_Start(&hadc1);
+//	    HAL_ADC_PollForConversion(&hadc1, 10);   // 等转换完成(Scan模式会扫完IN0)
+//	    uint16_t raw0 = HAL_ADC_GetValue(&hadc1);
+//	    HAL_ADC_PollForConversion(&hadc1, 10);   // 等第二个通道
+//	    uint16_t raw1 = HAL_ADC_GetValue(&hadc1);
+//	    HAL_ADC_Stop(&hadc1);
+//
+//	    HAL_Delay(50);
+//	    printf("raw:%d,%d\n", raw0, raw1);
 
+	    theta_e_global = 0.0f;
+	    Uq_cmd = 1.0f;
+	    Ud_cmd = 0.0f;
+
+	    i_a = ADC_TO_AMP(adc_buf[0], offset_A);   // 直接读,adc_buf 永远是最新谷底采样值
+	    i_b = ADC_TO_AMP(adc_buf[1], offset_B);
+	    i_c = -(i_a + i_b);
+	    HAL_Delay(50);
+	    printf("%.3f,%.3f,%.3f\n", i_a, i_b, i_c);
+
+//	    printf("raw:%d,%d off:%.0f,%.0f i:%.3f,%.3f\n",
+//	           adc_buf[0], adc_buf[1], offset_A, offset_B,
+//	           ADC_TO_AMP(adc_buf[0], offset_A),
+//	           ADC_TO_AMP(adc_buf[1], offset_B));
+//	    HAL_ADC_Start(&hadc1);
+//	    i_a = ADC_TO_AMP(adc_buf[0], offset_A);
+//	    i_b = ADC_TO_AMP(adc_buf[1], offset_B);
+//	    i_c = -(i_a + i_b);                        // 基尔霍夫: ia+ib+ic=0
+//	    HAL_Delay(50);
+//	    printf("%.3f,%.3f,%.3f\n", i_a, i_b, i_c); // VOFA: ia, ib, ic (安培)
+//	    HAL_ADC_Start(&hadc1);                       // 软件触发一次转换(扫两个通道)
+//	    HAL_Delay(100);                              // 先慢点,肉眼看数
+//	    printf("%d,%d\n", adc_buf[0], adc_buf[1]);   // FireWater: A相码值, B相码值
 //	    print_counter++;
 //	    if (print_counter >= 5000)
 //	    {
@@ -347,6 +432,67 @@ void SystemClock_Config(void)
 }
 
 /**
+  * @brief ADC1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_ADC1_Init(void)
+{
+
+  /* USER CODE BEGIN ADC1_Init 0 */
+
+  /* USER CODE END ADC1_Init 0 */
+
+  ADC_ChannelConfTypeDef sConfig = {0};
+
+  /* USER CODE BEGIN ADC1_Init 1 */
+
+  /* USER CODE END ADC1_Init 1 */
+
+  /** Configure the global features of the ADC (Clock, Resolution, Data Alignment and number of conversion)
+  */
+  hadc1.Instance = ADC1;
+  hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV4;
+  hadc1.Init.Resolution = ADC_RESOLUTION_12B;
+  hadc1.Init.ScanConvMode = ENABLE;
+  hadc1.Init.ContinuousConvMode = DISABLE;
+  hadc1.Init.DiscontinuousConvMode = DISABLE;
+  hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_RISING;
+  hadc1.Init.ExternalTrigConv = ADC_EXTERNALTRIGCONV_T3_TRGO;
+  hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+  hadc1.Init.NbrOfConversion = 2;
+  hadc1.Init.DMAContinuousRequests = ENABLE;
+  hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
+  if (HAL_ADC_Init(&hadc1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure for the selected ADC regular channel its corresponding rank in the sequencer and its sample time.
+  */
+  sConfig.Channel = ADC_CHANNEL_0;
+  sConfig.Rank = 1;
+  sConfig.SamplingTime = ADC_SAMPLETIME_84CYCLES;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure for the selected ADC regular channel its corresponding rank in the sequencer and its sample time.
+  */
+  sConfig.Channel = ADC_CHANNEL_4;
+  sConfig.Rank = 2;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN ADC1_Init 2 */
+
+  /* USER CODE END ADC1_Init 2 */
+
+}
+
+/**
   * @brief SPI1 Initialization Function
   * @param None
   * @retval None
@@ -369,7 +515,7 @@ static void MX_SPI1_Init(void)
   hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
   hspi1.Init.CLKPhase = SPI_PHASE_2EDGE;
   hspi1.Init.NSS = SPI_NSS_SOFT;
-  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_16;
+  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_32;
   hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
   hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
   hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
@@ -521,6 +667,22 @@ static void MX_USART2_UART_Init(void)
 }
 
 /**
+  * Enable DMA controller clock
+  */
+static void MX_DMA_Init(void)
+{
+
+  /* DMA controller clock enable */
+  __HAL_RCC_DMA2_CLK_ENABLE();
+
+  /* DMA interrupt init */
+  /* DMA2_Stream0_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA2_Stream0_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA2_Stream0_IRQn);
+
+}
+
+/**
   * @brief GPIO Initialization Function
   * @param None
   * @retval None
@@ -539,7 +701,6 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOC_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
- // HAL_GPIO_WritePin(EN_GATE_GPIO_Port, EN_GATE_Pin, GPIO_PIN_SET);
   HAL_GPIO_WritePin(EN_GATE_GPIO_Port, EN_GATE_Pin, GPIO_PIN_SET);
 
   /*Configure GPIO pin Output Level */
@@ -583,7 +744,6 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
     }
 }
 /* USER CODE END 4 */
-
 
 /**
   * @brief  This function is executed in case of error occurrence.
