@@ -51,6 +51,8 @@ ADC_HandleTypeDef hadc1;
 DMA_HandleTypeDef hdma_adc1;
 
 SPI_HandleTypeDef hspi1;
+DMA_HandleTypeDef hdma_spi1_rx;
+DMA_HandleTypeDef hdma_spi1_tx;
 
 TIM_HandleTypeDef htim2;
 TIM_HandleTypeDef htim3;
@@ -81,6 +83,11 @@ typedef struct {
 PI_Controller pi_id = {0};
 PI_Controller pi_iq = {0};
 volatile float iq_ref = 0.0f;   // q轴电流指令
+// ===== SPI DMA 流水线 =====
+uint8_t spi_tx_buf[2] = {0};
+uint8_t spi_rx_buf[2] = {0};
+volatile uint16_t angle_raw_dma = 0;     // DMA读回的原始角度
+volatile uint8_t  spi_busy = 0;          // 1=DMA进行中,防重入
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -134,7 +141,34 @@ uint16_t AS5047_ReadAngle(void)
     uint16_t raw = (rx_buf[0] << 8) | rx_buf[1];
     return raw & AS5047_ANGLE_MASK;
 }
+/**
+ * @brief 非阻塞踢一帧 SPI DMA 读角度
+ *        CS拉低 → 启动DMA收发 → 立即返回(不等待)
+ *        传输完成由 HAL_SPI_TxRxCpltCallback 收尾
+ */
+void AS5047_ReadAngle_DMA_Kick(void)
+{
+    if (spi_busy) return;            // 上一帧还没传完,跳过(防重入)
+    spi_busy = 1;
+    HAL_GPIO_WritePin(CSn_GPIO_Port, CSn_Pin, GPIO_PIN_RESET);  // CS↓
+    HAL_SPI_TransmitReceive_DMA(&hspi1, spi_tx_buf, spi_rx_buf, 2);
+    // 立即返回,DMA后台搬运,~2.86µs后触发完成回调
+}
 
+/**
+ * @brief SPI DMA 传输完成回调(HAL硬件自动调用)
+ *        CS拉高 → 解析角度 → 清busy
+ */
+void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi)
+{
+    if (hspi->Instance == SPI1)
+    {
+        HAL_GPIO_WritePin(CSn_GPIO_Port, CSn_Pin, GPIO_PIN_SET);  // CS↑
+        uint16_t raw = (spi_rx_buf[0] << 8) | spi_rx_buf[1];
+        angle_raw_dma = raw & AS5047_ANGLE_MASK;
+        spi_busy = 0;
+    }
+}
 // ============== 开环 SPWM ==============
 
 #define PWM_ARR             1800.0f         // ARR 值（M2 设定的）
@@ -271,6 +305,10 @@ int main(void)
   MX_ADC1_Init();
   /* USER CODE BEGIN 2 */
   HAL_Delay(200);          // 等 200ms,让 3.3V/VREF/INA 供电稳定
+
+  spi_tx_buf[0] = (AS5047_CMD_READ_ANGLE >> 8) & 0xFF;  // 0xFF
+    spi_tx_buf[1] = (AS5047_CMD_READ_ANGLE)      & 0xFF;  // 0xFF
+
   // ======== 第一步:电流零偏校准(必须在任何通电动作之前)========
   HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc_buf, 2);
 
@@ -316,7 +354,7 @@ int main(void)
   pi_iq.out_max = 6.0f;  pi_iq.out_min = -6.0f;
   pi_id.integral = 0;  pi_iq.integral = 0;
   // 启动 TIM3 Update 中断
-  __HAL_TIM_ENABLE_IT(&htim3, TIM_IT_UPDATE);
+//  __HAL_TIM_ENABLE_IT(&htim3, TIM_IT_UPDATE);
 //  // 占空比测试（50% = 1.65V 平均电压）
 //  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, 900);
 //  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, 900);
@@ -372,20 +410,30 @@ int main(void)
 //	    HAL_Delay(50);
 //	    printf("%.3f,%.3f,%.3f\n", i_a, i_b, i_c);
 
-	    iq_ref = 0.35f;     // ★给电流指令(规矩2:直接1.0,能自启动)
+//	    iq_ref = 0.35f;     // ★给电流指令(规矩2:直接1.0,能自启动)
 	    // 不再写 Uq_cmd/Ud_cmd
 
 	    // 读编码器,算真实电角度(方向用验证过对的 theta_m - offset)
-	    uint16_t raw = AS5047_ReadAngle();
-	    float theta_m = (float)raw / 16384.0f * TWO_PI;
-	    float theta_e = (theta_offset - theta_m) * POLE_PAIRS;
-	    theta_e = fmodf(theta_e, TWO_PI);
-	    if (theta_e < 0) theta_e += TWO_PI;
-	    theta_e_global = theta_e;
+//	    uint16_t raw = AS5047_ReadAngle();
+//	    float theta_m = (float)raw / 16384.0f * TWO_PI;
+//	    float theta_e = (theta_offset - theta_m) * POLE_PAIRS;
+//	    theta_e = fmodf(theta_e, TWO_PI);
+//	    if (theta_e < 0) theta_e += TWO_PI;
+//	    theta_e_global = theta_e;
 
 //	    HAL_Delay(2);
 //	    printf("%.3f,%.3f\n", i_d, i_q);   // 看id,iq
+	    // ===== Step1 验证: DMA读角度,只读不转 =====
+	    iq_ref = 0.0f;        // 不给电流,不转
+	    Uq_cmd = 0.0f;
+	    Ud_cmd = 0.0f;
 
+	    AS5047_ReadAngle_DMA_Kick();   // 踢一帧DMA
+	    HAL_Delay(10);                 // 等DMA传完(后台~3µs,这里给足余量)
+
+	    float deg = (float)angle_raw_dma / 16384.0f * 360.0f;
+	    printf("raw:%d deg:%.1f busy:%d\n", angle_raw_dma, deg, spi_busy);
+	    HAL_Delay(40);
 
 //	    printf("raw:%d,%d off:%.0f,%.0f i:%.3f,%.3f\n",
 //	           adc_buf[0], adc_buf[1], offset_A, offset_B,
@@ -554,7 +602,7 @@ static void MX_SPI1_Init(void)
   hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
   hspi1.Init.CLKPhase = SPI_PHASE_2EDGE;
   hspi1.Init.NSS = SPI_NSS_SOFT;
-  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_32;
+  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_16;
   hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
   hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
   hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
@@ -718,6 +766,12 @@ static void MX_DMA_Init(void)
   /* DMA2_Stream0_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA2_Stream0_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA2_Stream0_IRQn);
+  /* DMA2_Stream2_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA2_Stream2_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA2_Stream2_IRQn);
+  /* DMA2_Stream3_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA2_Stream3_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA2_Stream3_IRQn);
 
 }
 
