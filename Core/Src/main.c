@@ -73,6 +73,8 @@ volatile float theta_e_global = 0.0f;   // 主循环更新,中断使用
 uint16_t adc_buf[2];        // DMA 接收缓冲: [0]=A相(IN0/PA0), [1]=B相(IN4/PA4)
 float offset_A = 0, offset_B = 0;   // 提全局,FOC中断里换算电流要用
 float i_a = 0, i_b = 0, i_c = 0;    // 三相电流(安培),给VOFA看
+volatile float i_alpha = 0, i_beta = 0;   // Clark输出
+volatile float i_d = 0, i_q = 0;          // Park输出(直流量)
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -338,15 +340,30 @@ int main(void)
 //	    HAL_Delay(50);
 //	    printf("raw:%d,%d\n", raw0, raw1);
 
-	    theta_e_global = 0.0f;
-	    Uq_cmd = 1.0f;
+//	    theta_e_global = 0.0f;
+//	    Uq_cmd = 1.0f;
+//	    Ud_cmd = 0.0f;
+
+//	    i_a = ADC_TO_AMP(adc_buf[0], offset_A);   // 直接读,adc_buf 永远是最新谷底采样值
+//	    i_b = ADC_TO_AMP(adc_buf[1], offset_B);
+//	    i_c = -(i_a + i_b);
+//	    HAL_Delay(50);
+//	    printf("%.3f,%.3f,%.3f\n", i_a, i_b, i_c);
+
+	    Uq_cmd = 1.0f;     // 手动电压,让电机转
 	    Ud_cmd = 0.0f;
 
-	    i_a = ADC_TO_AMP(adc_buf[0], offset_A);   // 直接读,adc_buf 永远是最新谷底采样值
-	    i_b = ADC_TO_AMP(adc_buf[1], offset_B);
-	    i_c = -(i_a + i_b);
-	    HAL_Delay(50);
-	    printf("%.3f,%.3f,%.3f\n", i_a, i_b, i_c);
+	    // 读编码器,算真实电角度(方向用验证过对的 theta_m - offset)
+	    uint16_t raw = AS5047_ReadAngle();
+	    float theta_m = (float)raw / 16384.0f * TWO_PI;
+	    float theta_e = (theta_offset - theta_m) * POLE_PAIRS;
+	    theta_e = fmodf(theta_e, TWO_PI);
+	    if (theta_e < 0) theta_e += TWO_PI;
+	    theta_e_global = theta_e;
+
+	    HAL_Delay(2);
+	    printf("%.3f,%.3f\n", i_d, i_q);   // 看id,iq
+
 
 //	    printf("raw:%d,%d off:%.0f,%.0f i:%.3f,%.3f\n",
 //	           adc_buf[0], adc_buf[1], offset_A, offset_B,
@@ -736,6 +753,15 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
         float theta_e = theta_e_global;   // 用主循环算好的角度,中断不碰SPI
         float s = sinf(theta_e);
         float c = cosf(theta_e);
+
+        // ===== Step2: 电流采样 → Clark → Park =====★新增
+        float ia = ADC_TO_AMP(adc_buf[0], offset_A);
+        float ib = ADC_TO_AMP(adc_buf[1], offset_B);
+        i_alpha = ia;
+        i_beta  = (ia + 2.0f * ib) * 0.57735027f;   // 1/√3
+        i_d =  i_alpha * c + i_beta * s;
+        i_q = -i_alpha * s + i_beta * c;
+
         float Ualpha = Ud_cmd * c - Uq_cmd * s;
         float Ubeta  = Ud_cmd * s + Uq_cmd * c;
         Ua_dbg = Ualpha;   // 临时:看逆Park输出
