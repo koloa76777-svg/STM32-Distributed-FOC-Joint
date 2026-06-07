@@ -75,6 +75,12 @@ float offset_A = 0, offset_B = 0;   // 提全局,FOC中断里换算电流要用
 float i_a = 0, i_b = 0, i_c = 0;    // 三相电流(安培),给VOFA看
 volatile float i_alpha = 0, i_beta = 0;   // Clark输出
 volatile float i_d = 0, i_q = 0;          // Park输出(直流量)
+typedef struct {
+    float Kp, Ki, integral, out_max, out_min;
+} PI_Controller;
+PI_Controller pi_id = {0};
+PI_Controller pi_iq = {0};
+volatile float iq_ref = 0.0f;   // q轴电流指令
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -214,6 +220,18 @@ void Encoder_Calibrate(void)
     SVPWM(0.0f, 0.0f);
     HAL_Delay(500);
 }
+
+float PI_Update(PI_Controller *pi, float error)
+{
+    float p_out = pi->Kp * error;
+    pi->integral += pi->Ki * error;
+    if (pi->integral > pi->out_max) pi->integral = pi->out_max;
+    else if (pi->integral < pi->out_min) pi->integral = pi->out_min;
+    float output = p_out + pi->integral;
+    if (output > pi->out_max) output = pi->out_max;
+    else if (output < pi->out_min) output = pi->out_min;
+    return output;
+}
 /* USER CODE END 0 */
 
 /**
@@ -292,7 +310,11 @@ int main(void)
 
 //  printf("offset = %.4f rad\n", theta_offset);  // 打印确认
   // ★临时:卡在这里反复打印offset,看清了再继续(验证完删掉)
-
+  pi_id.Kp = 0.5f;  pi_id.Ki = 0.01f;
+  pi_iq.Kp = 0.5f;  pi_iq.Ki = 0.01f;
+  pi_id.out_max = 6.0f;  pi_id.out_min = -6.0f;
+  pi_iq.out_max = 6.0f;  pi_iq.out_min = -6.0f;
+  pi_id.integral = 0;  pi_iq.integral = 0;
   // 启动 TIM3 Update 中断
   __HAL_TIM_ENABLE_IT(&htim3, TIM_IT_UPDATE);
 //  // 占空比测试（50% = 1.65V 平均电压）
@@ -350,8 +372,8 @@ int main(void)
 //	    HAL_Delay(50);
 //	    printf("%.3f,%.3f,%.3f\n", i_a, i_b, i_c);
 
-	    Uq_cmd = 1.0f;     // 手动电压,让电机转
-	    Ud_cmd = 0.0f;
+	    iq_ref = 0.35f;     // ★给电流指令(规矩2:直接1.0,能自启动)
+	    // 不再写 Uq_cmd/Ud_cmd
 
 	    // 读编码器,算真实电角度(方向用验证过对的 theta_m - offset)
 	    uint16_t raw = AS5047_ReadAngle();
@@ -361,8 +383,8 @@ int main(void)
 	    if (theta_e < 0) theta_e += TWO_PI;
 	    theta_e_global = theta_e;
 
-	    HAL_Delay(2);
-	    printf("%.3f,%.3f\n", i_d, i_q);   // 看id,iq
+//	    HAL_Delay(2);
+//	    printf("%.3f,%.3f\n", i_d, i_q);   // 看id,iq
 
 
 //	    printf("raw:%d,%d off:%.0f,%.0f i:%.3f,%.3f\n",
@@ -762,8 +784,12 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
         i_d =  i_alpha * c + i_beta * s;
         i_q = -i_alpha * s + i_beta * c;
 
-        float Ualpha = Ud_cmd * c - Uq_cmd * s;
-        float Ubeta  = Ud_cmd * s + Uq_cmd * c;
+        // 电流环PI
+        float Ud = PI_Update(&pi_id, 0.0f   - i_d);   // id_ref=0
+        float Uq = PI_Update(&pi_iq, iq_ref - i_q);   // iq_ref=指令
+
+        float Ualpha = Ud * c - Uq * s;    // ★用Ud/Uq,不是Ud_cmd/Uq_cmd
+        float Ubeta  = Ud * s + Uq * c;
         Ua_dbg = Ualpha;   // 临时:看逆Park输出
         Ub_dbg = Ubeta;
         SVPWM(Ualpha, Ubeta);
