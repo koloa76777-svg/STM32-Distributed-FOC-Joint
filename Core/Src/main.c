@@ -88,6 +88,14 @@ uint8_t spi_tx_buf[2] = {0};
 uint8_t spi_rx_buf[2] = {0};
 volatile uint16_t angle_raw_dma = 0;     // DMA读回的原始角度
 volatile uint8_t  spi_busy = 0;          // 1=DMA进行中,防重入
+volatile uint32_t spi_cb_count = 0;
+volatile HAL_StatusTypeDef spi_kick_ret = HAL_OK;   // Kick时HAL返回值
+volatile uint32_t spi_state_dbg = 0;                // 踢之前的HAL State
+volatile float theta_comp = -1.3f;   // 对齐补偿角,调试时手动改
+volatile float delta_theta_dbg = 0.0f;
+volatile float theta_force = 0.0f;     // 开环强制电角度
+volatile float open_loop_speed = 0.0f; // 每拍递增量(电角速度)
+volatile float open_loop_volt = 0.8f;  // 开环电压幅值(V)
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -146,29 +154,65 @@ uint16_t AS5047_ReadAngle(void)
  *        CS拉低 → 启动DMA收发 → 立即返回(不等待)
  *        传输完成由 HAL_SPI_TxRxCpltCallback 收尾
  */
+//void AS5047_ReadAngle_DMA_Kick(void)
+//{
+//    if (spi_busy) return;            // 上一帧还没传完,跳过(防重入)
+//    spi_state_dbg = HAL_SPI_GetState(&hspi1);   // ★记录踢之前的State
+//    if (spi_state_dbg != HAL_SPI_STATE_READY) return;
+//    spi_busy = 1;
+//    HAL_GPIO_WritePin(CSn_GPIO_Port, CSn_Pin, GPIO_PIN_RESET);
+////    spi_kick_ret = HAL_SPI_Receive_DMA(&hspi1, spi_rx_buf, 2);  // ★只收不发
+//    spi_kick_ret = HAL_SPI_TransmitReceive_DMA(&hspi1, spi_tx_buf, spi_rx_buf, 2);  // ★记录返回值
+//    if (spi_kick_ret != HAL_OK)
+//    {
+//        spi_busy = 0;
+//        HAL_GPIO_WritePin(CSn_GPIO_Port, CSn_Pin, GPIO_PIN_SET);
+//    }
+//}
 void AS5047_ReadAngle_DMA_Kick(void)
 {
-    if (spi_busy) return;            // 上一帧还没传完,跳过(防重入)
-    spi_busy = 1;
-    HAL_GPIO_WritePin(CSn_GPIO_Port, CSn_Pin, GPIO_PIN_RESET);  // CS↓
-    HAL_SPI_TransmitReceive_DMA(&hspi1, spi_tx_buf, spi_rx_buf, 2);
-    // 立即返回,DMA后台搬运,~2.86µs后触发完成回调
-}
+    if (spi_busy) return;
 
+    HAL_SPI_StateTypeDef st = HAL_SPI_GetState(&hspi1);
+    if (st != HAL_SPI_STATE_READY)
+    {
+        // ★HAL状态机锁死(BUSY/ERROR),强制复位恢复
+        HAL_SPI_Abort(&hspi1);              // 中止当前传输
+        __HAL_SPI_DISABLE(&hspi1);
+        hspi1.ErrorCode = HAL_SPI_ERROR_NONE;
+        hspi1.State = HAL_SPI_STATE_READY;  // 强制拉回READY
+        __HAL_SPI_ENABLE(&hspi1);
+        HAL_GPIO_WritePin(CSn_GPIO_Port, CSn_Pin, GPIO_PIN_SET);  // CS归位
+        spi_busy = 0;
+        return;   // 这一拍先恢复,下一拍正常踢
+    }
+
+    spi_busy = 1;
+    HAL_GPIO_WritePin(CSn_GPIO_Port, CSn_Pin, GPIO_PIN_RESET);
+    spi_kick_ret = HAL_SPI_TransmitReceive_DMA(&hspi1, spi_tx_buf, spi_rx_buf, 2);
+    if (spi_kick_ret != HAL_OK)
+    {
+        spi_busy = 0;
+        HAL_GPIO_WritePin(CSn_GPIO_Port, CSn_Pin, GPIO_PIN_SET);
+    }
+}
 /**
  * @brief SPI DMA 传输完成回调(HAL硬件自动调用)
  *        CS拉高 → 解析角度 → 清busy
  */
 void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi)
+//void HAL_SPI_RxCpltCallback(SPI_HandleTypeDef *hspi)   // ★TxRx → Rx
 {
     if (hspi->Instance == SPI1)
     {
         HAL_GPIO_WritePin(CSn_GPIO_Port, CSn_Pin, GPIO_PIN_SET);  // CS↑
         uint16_t raw = (spi_rx_buf[0] << 8) | spi_rx_buf[1];
         angle_raw_dma = raw & AS5047_ANGLE_MASK;
-        spi_busy = 0;
+        spi_busy = 0;          // ★清忙标志,这是关键!
+        spi_cb_count++;
     }
 }
+
 // ============== 开环 SPWM ==============
 
 #define PWM_ARR             1800.0f         // ARR 值（M2 设定的）
@@ -247,9 +291,12 @@ void Encoder_Calibrate(void)
     HAL_Delay(1000);   // 等转子稳定对齐(听到"咔")
 
     // 读此刻编码器机械角(弧度),就是offset
-    uint16_t raw = AS5047_ReadAngle();
+//    uint16_t raw = AS5047_ReadAngle();
+//    theta_offset = (float)raw / 16384.0f * TWO_PI;
+    AS5047_ReadAngle();              // 第一次:丢弃(延迟响应,返回上一帧)
+    HAL_Delay(1);
+    uint16_t raw = AS5047_ReadAngle();   // 第二次:当前真实角度
     theta_offset = (float)raw / 16384.0f * TWO_PI;
-
     // 松开,电压归零
     SVPWM(0.0f, 0.0f);
     HAL_Delay(500);
@@ -353,8 +400,13 @@ int main(void)
   pi_id.out_max = 6.0f;  pi_id.out_min = -6.0f;
   pi_iq.out_max = 6.0f;  pi_iq.out_min = -6.0f;
   pi_id.integral = 0;  pi_iq.integral = 0;
+  // ★Step2: 开控制中断前,先踢一帧DMA"预热"
+  //   否则第一拍中断读 angle_raw_dma 还是0(没人踢过),θe会是无效值
+  //   预热后第一拍就有真实角度可取,流水线立即满载
+  AS5047_ReadAngle_DMA_Kick();
+  HAL_Delay(1);   // 等这帧DMA传回(后台~3µs,给足余量)
   // 启动 TIM3 Update 中断
-//  __HAL_TIM_ENABLE_IT(&htim3, TIM_IT_UPDATE);
+  __HAL_TIM_ENABLE_IT(&htim3, TIM_IT_UPDATE);
 //  // 占空比测试（50% = 1.65V 平均电压）
 //  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, 900);
 //  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, 900);
@@ -420,21 +472,18 @@ int main(void)
 //	    theta_e = fmodf(theta_e, TWO_PI);
 //	    if (theta_e < 0) theta_e += TWO_PI;
 //	    theta_e_global = theta_e;
-
-//	    HAL_Delay(2);
-//	    printf("%.3f,%.3f\n", i_d, i_q);   // 看id,iq
-	    // ===== Step1 验证: DMA读角度,只读不转 =====
-	    iq_ref = 0.0f;        // 不给电流,不转
-	    Uq_cmd = 0.0f;
-	    Ud_cmd = 0.0f;
-
-	    AS5047_ReadAngle_DMA_Kick();   // 踢一帧DMA
-	    HAL_Delay(10);                 // 等DMA传完(后台~3µs,这里给足余量)
-
-	    float deg = (float)angle_raw_dma / 16384.0f * 360.0f;
-	    printf("raw:%d deg:%.1f busy:%d\n", angle_raw_dma, deg, spi_busy);
-	    HAL_Delay(40);
-
+	    iq_ref = 0.05f;   // 先小一点,稳一点
+	    printf("%.3f,%.3f,%d\n", i_d, i_q, angle_raw_dma);  // id, iq, raw
+	    HAL_Delay(10);
+//	    printf("%.3f,%.3f,%d,%d\n", i_q, theta_e_global, angle_raw_dma, spi_busy);
+//	    iq_ref = 0.0f;   // ★先关电流,纯看读取链路
+//	    printf("raw:%d busy:%d st:%lu err:%lu\n",
+//	           angle_raw_dma, spi_busy,
+//	           (uint32_t)HAL_SPI_GetState(&hspi1), hspi1.ErrorCode);
+	    HAL_Delay(10);
+//	    open_loop_speed = 0.002f;   // 每拍0.002rad,50kHz → 100rad/s电角速度,慢速
+//	    printf("%.3f,%.3f\n", theta_force, theta_e_global);  // ch0=强制角, ch1=编码器算的电角
+//	    HAL_Delay(10);
 //	    printf("raw:%d,%d off:%.0f,%.0f i:%.3f,%.3f\n",
 //	           adc_buf[0], adc_buf[1], offset_A, offset_B,
 //	           ADC_TO_AMP(adc_buf[0], offset_A),
@@ -767,10 +816,10 @@ static void MX_DMA_Init(void)
   HAL_NVIC_SetPriority(DMA2_Stream0_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA2_Stream0_IRQn);
   /* DMA2_Stream2_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA2_Stream2_IRQn, 0, 0);
+  HAL_NVIC_SetPriority(DMA2_Stream2_IRQn, 0, 2);
   HAL_NVIC_EnableIRQ(DMA2_Stream2_IRQn);
   /* DMA2_Stream3_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA2_Stream3_IRQn, 0, 0);
+  HAL_NVIC_SetPriority(DMA2_Stream3_IRQn, 0, 2);
   HAL_NVIC_EnableIRQ(DMA2_Stream3_IRQn);
 
 }
@@ -821,12 +870,59 @@ static void MX_GPIO_Init(void)
 /* USER CODE BEGIN 4 */
 #define THETA_INCREMENT_ISR  0.00176f
 
-
+//void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+//{
+//    if (htim->Instance == TIM3)
+//    {
+//        // ===== 开环: 自己生成匀速旋转的电角度 =====
+//        theta_force += open_loop_speed;
+//        if (theta_force >= TWO_PI) theta_force -= TWO_PI;
+//        if (theta_force < 0)       theta_force += TWO_PI;
+//
+//        float s = sinf(theta_force);
+//        float c = cosf(theta_force);
+//
+//        // ===== 同时读编码器算真实电角度(只为观察,不参与驱动) =====
+//        uint16_t raw = angle_raw_dma;
+//        float theta_m = (float)raw / 16384.0f * TWO_PI;
+//        float theta_e_enc = (theta_offset - theta_m) * POLE_PAIRS + theta_comp;
+//        theta_e_enc = fmodf(theta_e_enc, TWO_PI);
+//        if (theta_e_enc < 0) theta_e_enc += TWO_PI;
+//        theta_e_global = theta_e_enc;   // 存编码器算的,给主循环对比
+//
+//        // ===== 电流采样(观察用) =====
+//        float ia = ADC_TO_AMP(adc_buf[0], offset_A);
+//        float ib = ADC_TO_AMP(adc_buf[1], offset_B);
+//        i_alpha = ia;
+//        i_beta  = (ia + 2.0f * ib) * 0.57735027f;
+//        // 用强制角度做Park(看开环下的id/iq)
+//        i_d =  i_alpha * c + i_beta * s;
+//        i_q = -i_alpha * s + i_beta * c;
+//
+//        // ===== 开环电压: 纯q轴给电压,直接驱动 =====
+//        float Ualpha = -open_loop_volt * s;   // Uq沿q轴: Uα=-Uq·sin, Uβ=Uq·cos
+//        float Ubeta  =  open_loop_volt * c;
+//        SVPWM(Ualpha, Ubeta);
+//
+//        // 踢DMA
+//        static uint16_t kick_div = 0;
+//        if (++kick_div >= 5) { kick_div = 0; AS5047_ReadAngle_DMA_Kick(); }
+//    }
+//}
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
     if (htim->Instance == TIM3)
     {
-        float theta_e = theta_e_global;   // 用主循环算好的角度,中断不碰SPI
+        // ===== ① 读上一拍DMA传回的角度 → 算电角度 =====
+        uint16_t raw = angle_raw_dma;                       // 上一拍踢的DMA,已传回
+        float theta_m = (float)raw / 16384.0f * TWO_PI;
+//       float theta_e = (theta_offset - theta_m) * POLE_PAIRS;  // ★方向:你验证过的那个
+//        float theta_e = (theta_offset - theta_m) * POLE_PAIRS + 1.5708f;  // +90°电角度补偿
+        float theta_e = (theta_offset - theta_m) * POLE_PAIRS - theta_comp;
+//        float theta_e = (theta_m - theta_offset) * POLE_PAIRS;
+        theta_e = fmodf(theta_e, TWO_PI);
+        if (theta_e < 0) theta_e += TWO_PI;
+        theta_e_global = theta_e;   // 存全局,留给调试看
         float s = sinf(theta_e);
         float c = cosf(theta_e);
 
@@ -837,7 +933,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
         i_beta  = (ia + 2.0f * ib) * 0.57735027f;   // 1/√3
         i_d =  i_alpha * c + i_beta * s;
         i_q = -i_alpha * s + i_beta * c;
-
+        delta_theta_dbg = atan2f(i_d, i_q);   // 反电动势法: 这个值=Δθ,对齐好应恒定
         // 电流环PI
         float Ud = PI_Update(&pi_id, 0.0f   - i_d);   // id_ref=0
         float Uq = PI_Update(&pi_iq, iq_ref - i_q);   // iq_ref=指令
@@ -847,6 +943,9 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
         Ua_dbg = Ualpha;   // 临时:看逆Park输出
         Ub_dbg = Ubeta;
         SVPWM(Ualpha, Ubeta);
+        // ===== ⑥ 踢下一拍DMA(降频:每50拍踢一次,验证重入假设) =====
+        static uint16_t kick_div = 0;
+        if (++kick_div >= 5) { kick_div = 0; AS5047_ReadAngle_DMA_Kick(); }
     }
 }
 /* USER CODE END 4 */
