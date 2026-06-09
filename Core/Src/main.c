@@ -96,6 +96,12 @@ volatile float delta_theta_dbg = 0.0f;
 volatile float theta_force = 0.0f;     // 开环强制电角度
 volatile float open_loop_speed = 0.0f; // 每拍递增量(电角速度)
 volatile float open_loop_volt = 0.8f;  // 开环电压幅值(V)
+// ===== 速度估计 =====
+volatile float omega_e = 0.0f;        // 电角速度估计(rad/s),滤波后
+volatile float theta_e_prev = 0.0f;   // 上一次电角度(算微分用)
+volatile float omega_raw = 0.0f;      // 微分原始值(滤波前,调试看)
+PI_Controller pi_speed = {0};         // 速度环PI
+volatile float omega_ref = 0.0f;      // 目标电角速度(rad/s)
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -419,93 +425,15 @@ int main(void)
 
   while (1)
   {
-//	    Uq_cmd = 1.0f;   // 先0,验证
-//
-//	    // 主循环读编码器,算电角度,存全局给中断用
-//	    uint16_t raw = AS5047_ReadAngle();
-//	    float theta_m = (float)raw / 16384.0f * TWO_PI;
-////	    float theta_e = (theta_offset - theta_m) * POLE_PAIRS;
-//	    float theta_e = (theta_m - theta_offset) * POLE_PAIRS;  // 反过来试
-//	    theta_e = fmodf(theta_e, TWO_PI);
-//	    if (theta_e < 0) theta_e += TWO_PI;
-//	    theta_e_global = theta_e;   // 更新给中断
-//	    theta_e_global = 1.57f;   // 固定电角度=0,中断读这个跑SVPWM
-//	    Uq_cmd = 2.0f;           // 小Uq,产生稳定电流
-//	    Ud_cmd = 0.0f;
-//
-//	    // 临时:同时打印原始码值和换算电流
-//	    HAL_Delay(50);
-//	    printf("raw:%d,%d\n", adc_buf[0], adc_buf[1]);
-
-//	    theta_e_global = 0.0f;
-//	    Uq_cmd = 1.0f;
-//	    Ud_cmd = 0.0f;
-//
-//	    // 标准轮询读法:启动 → 等完成 → 读
-//	    HAL_ADC_Start(&hadc1);
-//	    HAL_ADC_PollForConversion(&hadc1, 10);   // 等转换完成(Scan模式会扫完IN0)
-//	    uint16_t raw0 = HAL_ADC_GetValue(&hadc1);
-//	    HAL_ADC_PollForConversion(&hadc1, 10);   // 等第二个通道
-//	    uint16_t raw1 = HAL_ADC_GetValue(&hadc1);
-//	    HAL_ADC_Stop(&hadc1);
-//
-//	    HAL_Delay(50);
-//	    printf("raw:%d,%d\n", raw0, raw1);
-
-//	    theta_e_global = 0.0f;
-//	    Uq_cmd = 1.0f;
-//	    Ud_cmd = 0.0f;
-
-//	    i_a = ADC_TO_AMP(adc_buf[0], offset_A);   // 直接读,adc_buf 永远是最新谷底采样值
-//	    i_b = ADC_TO_AMP(adc_buf[1], offset_B);
-//	    i_c = -(i_a + i_b);
-//	    HAL_Delay(50);
-//	    printf("%.3f,%.3f,%.3f\n", i_a, i_b, i_c);
-
-//	    iq_ref = 0.35f;     // ★给电流指令(规矩2:直接1.0,能自启动)
-	    // 不再写 Uq_cmd/Ud_cmd
-
-	    // 读编码器,算真实电角度(方向用验证过对的 theta_m - offset)
-//	    uint16_t raw = AS5047_ReadAngle();
-//	    float theta_m = (float)raw / 16384.0f * TWO_PI;
-//	    float theta_e = (theta_offset - theta_m) * POLE_PAIRS;
-//	    theta_e = fmodf(theta_e, TWO_PI);
-//	    if (theta_e < 0) theta_e += TWO_PI;
-//	    theta_e_global = theta_e;
-	    iq_ref = 0.05f;   // 先小一点,稳一点
-	    printf("%.3f,%.3f,%d\n", i_d, i_q, angle_raw_dma);  // id, iq, raw
+	  pi_speed.Kp = 0.002f;   // 速度环Kp(先小,稳了再加)
+	    pi_speed.Ki = 0.0002f;  // 速度环Ki
+	    pi_speed.out_max =  1.5f;   // iq_ref上限 = 电流限幅
+	    pi_speed.out_min = -1.5f;
+	    pi_speed.integral = 0;
+	    omega_ref = 200.0f;   // ★目标电角速度50rad/s(慢速起步)
+	    // 不要再写 iq_ref!
+	    printf("%.2f,%.2f,%.3f\n", omega_ref, omega_e, iq_ref);  // 目标ω, 实际ω, 速度环输出的iq_ref
 	    HAL_Delay(10);
-//	    printf("%.3f,%.3f,%d,%d\n", i_q, theta_e_global, angle_raw_dma, spi_busy);
-//	    iq_ref = 0.0f;   // ★先关电流,纯看读取链路
-//	    printf("raw:%d busy:%d st:%lu err:%lu\n",
-//	           angle_raw_dma, spi_busy,
-//	           (uint32_t)HAL_SPI_GetState(&hspi1), hspi1.ErrorCode);
-	    HAL_Delay(10);
-//	    open_loop_speed = 0.002f;   // 每拍0.002rad,50kHz → 100rad/s电角速度,慢速
-//	    printf("%.3f,%.3f\n", theta_force, theta_e_global);  // ch0=强制角, ch1=编码器算的电角
-//	    HAL_Delay(10);
-//	    printf("raw:%d,%d off:%.0f,%.0f i:%.3f,%.3f\n",
-//	           adc_buf[0], adc_buf[1], offset_A, offset_B,
-//	           ADC_TO_AMP(adc_buf[0], offset_A),
-//	           ADC_TO_AMP(adc_buf[1], offset_B));
-//	    HAL_ADC_Start(&hadc1);
-//	    i_a = ADC_TO_AMP(adc_buf[0], offset_A);
-//	    i_b = ADC_TO_AMP(adc_buf[1], offset_B);
-//	    i_c = -(i_a + i_b);                        // 基尔霍夫: ia+ib+ic=0
-//	    HAL_Delay(50);
-//	    printf("%.3f,%.3f,%.3f\n", i_a, i_b, i_c); // VOFA: ia, ib, ic (安培)
-//	    HAL_ADC_Start(&hadc1);                       // 软件触发一次转换(扫两个通道)
-//	    HAL_Delay(100);                              // 先慢点,肉眼看数
-//	    printf("%d,%d\n", adc_buf[0], adc_buf[1]);   // FireWater: A相码值, B相码值
-//	    print_counter++;
-//	    if (print_counter >= 5000)
-//	    {
-//	        print_counter = 0;
-//	        printf("theta_m=%.1f theta_e=%.1f Uq=%.2f\n",
-//	               theta_m*57.3f, theta_e*57.3f, Uq_cmd);
-//	        //printf("Ualpha=%.2f Ubeta=%.2f Uq=%.2f\n", Ua_dbg, Ub_dbg, Uq_cmd);
-//	        //	        printf("%.2f,%.2f\n", theta_m*57.3f, theta_e*57.3f);
-//	    }
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -944,8 +872,28 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
         Ub_dbg = Ubeta;
         SVPWM(Ualpha, Ubeta);
         // ===== ⑥ 踢下一拍DMA(降频:每50拍踢一次,验证重入假设) =====
+        // ===== 速度估计(跟随θe更新节奏,分频5 → 10kHz) =====
         static uint16_t kick_div = 0;
-        if (++kick_div >= 5) { kick_div = 0; AS5047_ReadAngle_DMA_Kick(); }
+                if (++kick_div >= 5)
+                {
+                    kick_div = 0;
+
+                    // 1) 角度差(过零处理)
+                    float dtheta = theta_e - theta_e_prev;
+                    if (dtheta >  3.14159265f) dtheta -= TWO_PI;
+                    if (dtheta < -3.14159265f) dtheta += TWO_PI;
+                    theta_e_prev = theta_e;
+
+                    // 2) 微分 + 滤波
+                    omega_raw = dtheta / 0.0001f;
+                    omega_e = 0.05f * omega_raw + 0.95f * omega_e;
+
+                    // 3) ★速度环PI: ω误差 → iq_ref
+                    iq_ref = PI_Update(&pi_speed, -(omega_ref - omega_e));  // ★误差取反,修正反馈方向
+
+                    // 4) 踢编码器DMA
+                    AS5047_ReadAngle_DMA_Kick();
+                }
     }
 }
 /* USER CODE END 4 */
