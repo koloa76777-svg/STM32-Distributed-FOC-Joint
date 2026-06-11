@@ -39,6 +39,8 @@
 #define R_SHUNT       0.01f
 // 码值差 → 安培: (raw - offset) * Vref / 4096 / (Gain * Rshunt)
 #define ADC_TO_AMP(raw, off)  (((float)(raw) - (off)) * ADC_VREF / ADC_RES / (INA_GAIN * R_SHUNT))
+#define POS_DEADBAND  0.05f   // 位置环死区(rad),略大于编码器噪声峰峰
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -102,6 +104,26 @@ volatile float theta_e_prev = 0.0f;   // 上一次电角度(算微分用)
 volatile float omega_raw = 0.0f;      // 微分原始值(滤波前,调试看)
 PI_Controller pi_speed = {0};         // 速度环PI
 volatile float omega_ref = 0.0f;      // 目标电角速度(rad/s)
+
+// ===== PLL 速度观测器 =====
+typedef struct {
+    float theta_hat;   // 估计机械角(rad)
+    float omega_hat;   // 估计机械角速度(rad/s)
+    float Kp;          // PLL比例增益
+    float Ki;          // PLL积分增益
+    float Ts;          // 采样周期(s)
+} PLL_Observer;
+
+PLL_Observer pll = {0};
+// ===== M法测速: 环形缓冲存历史电角度 =====
+#define SPEED_WIN  10              // 测速窗口(拍数),先10试
+float theta_hist[SPEED_WIN] = {0};   // 历史电角度环形缓冲
+volatile uint8_t hist_idx = 0;       // 环形缓冲写指针
+// ===== 位置环参数 =====
+float    theta_target   = 0.0f;    // 目标机械角(rad), 调试时手动改这个看"指哪打哪"
+float    Kp_pos         = 0.6f;    // 位置环P, 先小; 单位(rad/s)/rad
+float    omega_max_mech = 3.0f;    // 机械角ω_ref限幅(rad/s), 防误差大时飞车
+float    Kd_pos = 0.02f;   // 速度阻尼; 单位 A/(rad/s
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -228,7 +250,7 @@ void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi)
 #define POLE_PAIRS          7               // 5010 极对数
 #define TWO_PI              6.28318530718f
 #define TWO_PI_OVER_3       2.09439510239f  // 120°
-
+#define PI 					3.14159265f
 /**
  * @brief 设置三相 PWM 占空比
  * @param Ua, Ub, Uc 三相电压指令 (-VBUS/2 ~ +VBUS/2)
@@ -319,6 +341,19 @@ float PI_Update(PI_Controller *pi, float error)
     else if (output < pi->out_min) output = pi->out_min;
     return output;
 }
+void PLL_Update(PLL_Observer *p, float theta_m)
+{
+    float err = theta_m - p->theta_hat;
+    while (err >  PI) err -= TWO_PI;
+    while (err < -PI) err += TWO_PI;
+
+    p->omega_hat += p->Ki * err * p->Ts;          // 积分项累加(这就是平滑速度)
+    p->theta_hat += (p->omega_hat + p->Kp * err) * p->Ts;  // 角度更新(含比例修正)
+
+    if (p->theta_hat >= TWO_PI) p->theta_hat -= TWO_PI;
+    if (p->theta_hat <  0)      p->theta_hat += TWO_PI;
+}
+// 平滑速度取 p->omega_hat (机械角速度), ×POLE_PAIRS 得电角速度
 /* USER CODE END 0 */
 
 /**
@@ -408,9 +443,28 @@ int main(void)
   pi_id.integral = 0;  pi_iq.integral = 0;
   // ★Step2: 开控制中断前,先踢一帧DMA"预热"
   //   否则第一拍中断读 angle_raw_dma 还是0(没人踢过),θe会是无效值
+  // ===== 速度环参数(初始化跑一次,别放while里) =====
+  pi_speed.Kp = 0.001f;
+  pi_speed.Ki = 0.0001f;
+  pi_speed.out_max =  1.5f;
+  pi_speed.out_min = -1.5f;
+  pi_speed.integral = 0;
   //   预热后第一拍就有真实角度可取,流水线立即满载
+
+  // ===== PLL观测器初始化 (fn=80Hz, ζ=0.707) =====
+    pll.Ts = 0.0001f;   // 采样周期=测速节奏=1ms(和原M法同节奏)
+    float pll_wn = 2.0f * PI * 80.0f;     // ωn, 带宽80Hz
+    pll.Kp = 2.0f * 0.707f * pll_wn;      // ≈710
+    pll.Ki = pll_wn * pll_wn;             // ≈252000
+    pll.theta_hat  = theta_target;        // 初值=当前机械角(你前面已读), 避免启动猛冲
+    pll.omega_hat  = 0.0f;
   AS5047_ReadAngle_DMA_Kick();
   HAL_Delay(1);   // 等这帧DMA传回(后台~3µs,给足余量)
+
+  {
+      uint16_t raw0 = angle_raw_dma;
+      theta_target = (float)raw0 / 16384.0f * TWO_PI;   // 当前机械角
+  }
   // 启动 TIM3 Update 中断
   __HAL_TIM_ENABLE_IT(&htim3, TIM_IT_UPDATE);
 //  // 占空比测试（50% = 1.65V 平均电压）
@@ -425,15 +479,32 @@ int main(void)
 
   while (1)
   {
-	  pi_speed.Kp = 0.002f;   // 速度环Kp(先小,稳了再加)
-	    pi_speed.Ki = 0.0002f;  // 速度环Ki
-	    pi_speed.out_max =  1.5f;   // iq_ref上限 = 电流限幅
-	    pi_speed.out_min = -1.5f;
-	    pi_speed.integral = 0;
-	    omega_ref = 200.0f;   // ★目标电角速度50rad/s(慢速起步)
-	    // 不要再写 iq_ref!
-	    printf("%.2f,%.2f,%.3f\n", omega_ref, omega_e, iq_ref);  // 目标ω, 实际ω, 速度环输出的iq_ref
-	    HAL_Delay(10);
+//	  pi_speed.Kp = 0.002f;   // 速度环Kp(先小,稳了再加)
+//	    pi_speed.Ki = 0.0002f;  // 速度环Ki
+//	    pi_speed.out_max =  1.5f;   // iq_ref上限 = 电流限幅
+//	    pi_speed.out_min = -1.5f;
+//	    pi_speed.integral = 0;
+//	    omega_ref = 0.0f;   // ★目标电角速度50rad/s(慢速起步)
+//	    // 不要再写 iq_ref!
+//	    HAL_Delay(10);
+//	    omega_ref = 0.0f;   // 先不驱动
+//	    printf("%.2f,%.2f\n", omega_raw, omega_e);
+//	    HAL_Delay(10);
+//	    printf("%.2f,%.2f,%.3f\n", omega_ref, omega_e, iq_ref);
+//	    HAL_Delay(1);   // 1kHz发送,够看抖动
+	    printf("%.3f,%.3f,%.2f\n",
+	           i_d,        // ch0: d轴电流, 对齐好应≈0
+	           i_q,        // ch1: q轴电流
+	           omega_e);   // ch2: 电角速度
+//	   printf("%.3f,%.3f,%.3f\n", i_d, i_q, theta_e_global);  // d轴电流, q轴电流, 电角度
+//	    printf("%.4f,%.4f,%.4f,%.2f,%.2f,%.2f,%.3f\n",
+//	               (float)angle_raw_dma / 16384.0f * TWO_PI,  // ch0: 真实机械角theta_m
+//	               pll.theta_hat,                              // ch1: PLL估计角theta_hat
+//	               pll.theta_hat - (float)angle_raw_dma / 16384.0f * TWO_PI,  // ch2: 滞后误差(rad)
+//	               pll.omega_hat,omega_ref, omega_e, iq_ref);                             // ch3: PLL机械角速度
+	        HAL_Delay(1);
+
+
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -878,20 +949,68 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
                 {
                     kick_div = 0;
 
-                    // 1) 角度差(过零处理)
-                    float dtheta = theta_e - theta_e_prev;
-                    if (dtheta >  3.14159265f) dtheta -= TWO_PI;
-                    if (dtheta < -3.14159265f) dtheta += TWO_PI;
-                    theta_e_prev = theta_e;
+//                    // ===== M法测速: 当前角度 vs N拍前角度 =====
+//                    float theta_now = theta_e;
+//                    float theta_old = theta_hist[hist_idx];   // 环形缓冲里最旧的(N拍前)
+//
+//                    // 角度差(过零处理)
+//                    float dtheta = theta_now - theta_old;
+//                    if (dtheta >  3.14159265f) dtheta -= TWO_PI;
+//                    if (dtheta < -3.14159265f) dtheta += TWO_PI;
+//
+//                    // 总时间 = N拍 × (5中断×20µs) = SPEED_WIN × 0.0001s
+//                    omega_raw = dtheta / (SPEED_WIN * 0.0001f);
+//
+//                    // 轻滤波即可(噪声已从源头降低)
+//                    omega_e = 0.03f * omega_raw + 0.97f * omega_e;
+//
+//                    // 当前角度写入环形缓冲,指针前进
+//                    theta_hist[hist_idx] = theta_now;
+//                    hist_idx = (hist_idx + 1) % SPEED_WIN;
+                    // ===== PLL观测器测速(替换M法) =====
+                     PLL_Update(&pll, theta_m);          // 喂机械角
+                     omega_e = -pll.omega_hat * POLE_PAIRS;  // 机械角速度→电角速度
 
-                    // 2) 微分 + 滤波
-                    omega_raw = dtheta / 0.0001f;
-                    omega_e = 0.05f * omega_raw + 0.95f * omega_e;
+                    // 位置环用PLL的平滑角度(可选,先用编码器原始theta_m也行)
+                    // float theta_for_pos = pll.theta_hat;
+                    omega_ref=500;
+                    iq_ref = 0.0f;   // ★直接给恒定转矩电流, 不经速度环
+//                    if(0)
+//                    {       // ===== ★位置环 P (套在速度环外) ===== 新增
+//                    // 误差用机械角(单圈最短路径), 输出乘POLE_PAIRS转成电角度ω_ref
+//                    float theta_err = theta_target - theta_m;            // 机械角误差(rad)
+//                    while (theta_err >  PI) theta_err -= TWO_PI;         // wrap到±π,走最短路
+//                    while (theta_err < -PI) theta_err += TWO_PI;
+////                    // ===== ★位置环死区: 误差在±ε内当作0,屏蔽编码器噪声 =====
+////                    if (theta_err < POS_DEADBAND && theta_err > -POS_DEADBAND)
+////                        theta_err = 0.0f;
+//                    float omega_ref_mech = Kp_pos * theta_err;           // 机械角ω_ref(rad/s)
+//                    if (omega_ref_mech >  omega_max_mech) omega_ref_mech =  omega_max_mech;
+//                    if (omega_ref_mech < -omega_max_mech) omega_ref_mech = -omega_max_mech;
+//
+//                    omega_ref = omega_ref_mech * POLE_PAIRS;             // ★转电角度,喂速度环
+//                    }
+                    // 速度环PI
+//                    iq_ref = PI_Update(&pi_speed, -(omega_ref - omega_e));
+                    // ===== PLL测速(只为D项阻尼用, 可以重滤波) =====
+                    PLL_Update(&pll, theta_m);
+                    omega_e = pll.omega_hat * POLE_PAIRS;
+                    // 给omega_e再加一层重滤波, 专门给D项用(慢没关系)
+                    static float omega_filt = 0;
+                    omega_filt = 0.9f * omega_filt + 0.1f * omega_e;
 
-                    // 3) ★速度环PI: ω误差 → iq_ref
-                    iq_ref = PI_Update(&pi_speed, -(omega_ref - omega_e));  // ★误差取反,修正反馈方向
+                    // ===== 位置环PD → 直接出iq_ref (砍掉速度环) =====
+                    float theta_err = theta_target - theta_m;
+                    while (theta_err >  PI) theta_err -= TWO_PI;
+                    while (theta_err < -PI) theta_err += TWO_PI;
 
-                    // 4) 踢编码器DMA
+                    // P: 位置误差(干净) ; D: 速度阻尼(脏但只做阻尼)
+                    iq_ref = Kp_pos * theta_err - Kd_pos * (omega_filt / POLE_PAIRS);
+
+                    // iq_ref限幅
+                    if (iq_ref >  1.5f) iq_ref =  1.5f;
+                    if (iq_ref < -1.5f) iq_ref = -1.5f;
+                    // 踢DMA
                     AS5047_ReadAngle_DMA_Kick();
                 }
     }
