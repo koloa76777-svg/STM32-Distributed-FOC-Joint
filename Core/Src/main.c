@@ -123,7 +123,8 @@ volatile uint8_t hist_idx = 0;       // 环形缓冲写指针
 float    theta_target   = 0.0f;    // 目标机械角(rad), 调试时手动改这个看"指哪打哪"
 float    Kp_pos         = 0.6f;    // 位置环P, 先小; 单位(rad/s)/rad
 float    omega_max_mech = 3.0f;    // 机械角ω_ref限幅(rad/s), 防误差大时飞车
-float    Kd_pos = 0.02f;   // 速度阻尼; 单位 A/(rad/s
+float    Kd_pos = 0.01f;   // 速度阻尼; 单位 A/(rad/s
+float Ki_pos = 0.001f;   // 位置环I, 先很小; 专治卡死/稳态误差
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -492,10 +493,11 @@ int main(void)
 //	    HAL_Delay(10);
 //	    printf("%.2f,%.2f,%.3f\n", omega_ref, omega_e, iq_ref);
 //	    HAL_Delay(1);   // 1kHz发送,够看抖动
-	    printf("%.3f,%.3f,%.2f\n",
-	           i_d,        // ch0: d轴电流, 对齐好应≈0
-	           i_q,        // ch1: q轴电流
-	           omega_e);   // ch2: 电角速度
+	  printf("%.3f,%.3f,%.3f,%.4f\n",
+	            i_d,            // ch0: d轴电流(卡住时应该≈0, 若不为0=对齐残差)
+	            i_q,            // ch1: q轴电流
+	            theta_e_global, // ch2: 当前电角度
+	            theta_target - (float)angle_raw_dma/16384.0f*TWO_PI);  // ch3: 位置误差(rad)
 //	   printf("%.3f,%.3f,%.3f\n", i_d, i_q, theta_e_global);  // d轴电流, q轴电流, 电角度
 //	    printf("%.4f,%.4f,%.4f,%.2f,%.2f,%.2f,%.3f\n",
 //	               (float)angle_raw_dma / 16384.0f * TWO_PI,  // ch0: 真实机械角theta_m
@@ -968,13 +970,13 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 //                    theta_hist[hist_idx] = theta_now;
 //                    hist_idx = (hist_idx + 1) % SPEED_WIN;
                     // ===== PLL观测器测速(替换M法) =====
-                     PLL_Update(&pll, theta_m);          // 喂机械角
-                     omega_e = -pll.omega_hat * POLE_PAIRS;  // 机械角速度→电角速度
-
-                    // 位置环用PLL的平滑角度(可选,先用编码器原始theta_m也行)
-                    // float theta_for_pos = pll.theta_hat;
-                    omega_ref=500;
-                    iq_ref = 0.0f;   // ★直接给恒定转矩电流, 不经速度环
+//                     PLL_Update(&pll, theta_m);          // 喂机械角
+//                     omega_e = -pll.omega_hat * POLE_PAIRS;  // 机械角速度→电角速度
+//
+//                    // 位置环用PLL的平滑角度(可选,先用编码器原始theta_m也行)
+//                    // float theta_for_pos = pll.theta_hat;
+//                    omega_ref=500;
+//                    iq_ref = 0.0f;   // ★直接给恒定转矩电流, 不经速度环
 //                    if(0)
 //                    {       // ===== ★位置环 P (套在速度环外) ===== 新增
 //                    // 误差用机械角(单圈最短路径), 输出乘POLE_PAIRS转成电角度ω_ref
@@ -1001,15 +1003,29 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 
                     // ===== 位置环PD → 直接出iq_ref (砍掉速度环) =====
                     float theta_err = theta_target - theta_m;
-                    while (theta_err >  PI) theta_err -= TWO_PI;
-                    while (theta_err < -PI) theta_err += TWO_PI;
+                                        while (theta_err >  PI) theta_err -= TWO_PI;
+                                        while (theta_err < -PI) theta_err += TWO_PI;
 
-                    // P: 位置误差(干净) ; D: 速度阻尼(脏但只做阻尼)
-                    iq_ref = Kp_pos * theta_err - Kd_pos * (omega_filt / POLE_PAIRS);
+                                        static float pos_integral = 0.0f;
 
-                    // iq_ref限幅
-                    if (iq_ref >  1.5f) iq_ref =  1.5f;
-                    if (iq_ref < -1.5f) iq_ref = -1.5f;
+                                        if (theta_err < 0.01f && theta_err > -0.01f) {
+                                            // ★死区内: 冻结输出, 只保留积分保持力矩, 不跑P/D(消抖)
+                                            iq_ref = pos_integral;        // 维持保持力矩, 不响应噪声
+                                        } else {
+                                            // 死区外: 正常PID
+                                            if (theta_err < 0.6f && theta_err > -0.6f) {
+                                                pos_integral += Ki_pos * theta_err;
+                                                if (pos_integral >  0.5f) pos_integral =  0.5f;
+                                                if (pos_integral < -0.5f) pos_integral = -0.5f;
+                                            } else {
+                                                pos_integral = 0.0f;
+                                            }
+                                            iq_ref = Kp_pos * theta_err + pos_integral
+                                                     - Kd_pos * (omega_filt / POLE_PAIRS);
+                                        }
+
+                                        if (iq_ref >  1.5f) iq_ref =  1.5f;
+                                        if (iq_ref < -1.5f) iq_ref = -1.5f;
                     // 踢DMA
                     AS5047_ReadAngle_DMA_Kick();
                 }
