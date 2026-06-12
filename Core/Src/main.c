@@ -1,5 +1,6 @@
 /* USER CODE BEGIN Header */
-/**
+/**串口用不了，我在debug里面改theta_target，可以实现控制。希望能优化一下，然后在theta_multi不断增大过程中，电机出现了抖动，在theta_multi不断减小的过程中，电机抖动明显减弱非常多。
+ * 这是一个有意思的点。把这个弄完之后，我们就停下来了，准备弄CAN通信了，然后开始上传github，当成制作简历的一个项目。
   ******************************************************************************
   * @file           : main.c
   * @brief          : Main program body
@@ -23,6 +24,7 @@
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
 #include <math.h>   // 加这一行（sin、PI）
+#include <stdlib.h>   // atof
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -121,10 +123,22 @@ float theta_hist[SPEED_WIN] = {0};   // 历史电角度环形缓冲
 volatile uint8_t hist_idx = 0;       // 环形缓冲写指针
 // ===== 位置环参数 =====
 float    theta_target   = 0.0f;    // 目标机械角(rad), 调试时手动改这个看"指哪打哪"
-float    Kp_pos         = 0.6f;    // 位置环P, 先小; 单位(rad/s)/rad
+float    Kp_pos         = 0.8f;    // 位置环P, 先小; 单位(rad/s)/rad
 float    omega_max_mech = 3.0f;    // 机械角ω_ref限幅(rad/s), 防误差大时飞车
 float    Kd_pos = 0.01f;   // 速度阻尼; 单位 A/(rad/s
 float Ki_pos = 0.001f;   // 位置环I, 先很小; 专治卡死/稳态误差
+
+// ===== 多圈累加角 =====
+float theta_multi = 0.0f;        // 多圈连续机械角(rad), 可超出0~2π
+float theta_m_last = 0.0f;       // 上一拍单圈机械角(检测过零用)
+volatile int32_t turns = 0;      // 圈数计数(调试看)
+volatile float theta_target_final = 0.0f;   // 最终目标(你真正想去的位置)
+float theta_ramp_rate = 0.0001f;    // 每拍爬升步长(rad/拍), 决定转速; 先小
+
+// ===== 串口接收指令 =====
+uint8_t rx_byte;                 // 单字节接收
+char rx_cmd_buf[32];             // 命令字符串缓冲
+volatile uint8_t rx_cmd_idx = 0; // 缓冲写指针
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -459,13 +473,17 @@ int main(void)
     pll.Ki = pll_wn * pll_wn;             // ≈252000
     pll.theta_hat  = theta_target;        // 初值=当前机械角(你前面已读), 避免启动猛冲
     pll.omega_hat  = 0.0f;
+
   AS5047_ReadAngle_DMA_Kick();
   HAL_Delay(1);   // 等这帧DMA传回(后台~3µs,给足余量)
 
   {
       uint16_t raw0 = angle_raw_dma;
-      theta_target = (float)raw0 / 16384.0f * TWO_PI;   // 当前机械角
+//      theta_target = (float)raw0 / 16384.0f * TWO_PI;   // 当前机械角
+      theta_target = 0.0f;   // 与theta_multi初值(0)对齐, 上电原地不动
   }
+  // 启动UART接收中断(单字节, 收到后进回调)
+  HAL_UART_Receive_IT(&huart2, &rx_byte, 1);
   // 启动 TIM3 Update 中断
   __HAL_TIM_ENABLE_IT(&htim3, TIM_IT_UPDATE);
 //  // 占空比测试（50% = 1.65V 平均电压）
@@ -493,11 +511,16 @@ int main(void)
 //	    HAL_Delay(10);
 //	    printf("%.2f,%.2f,%.3f\n", omega_ref, omega_e, iq_ref);
 //	    HAL_Delay(1);   // 1kHz发送,够看抖动
-	  printf("%.3f,%.3f,%.3f,%.4f\n",
-	            i_d,            // ch0: d轴电流(卡住时应该≈0, 若不为0=对齐残差)
-	            i_q,            // ch1: q轴电流
-	            theta_e_global, // ch2: 当前电角度
-	            theta_target - (float)angle_raw_dma/16384.0f*TWO_PI);  // ch3: 位置误差(rad)
+//	  printf("%.3f,%.3f,%.3f,%.4f\n",
+//	            i_d,            // ch0: d轴电流(卡住时应该≈0, 若不为0=对齐残差)
+//	            i_q,            // ch1: q轴电流
+//	            theta_e_global, // ch2: 当前电角度
+//	            theta_target - (float)angle_raw_dma/16384.0f*TWO_PI);  // ch3: 位置误差(rad)
+
+	  printf("%.3f,%.3f,%.2f,%.2f,%.2f\n",
+	             (float)angle_raw_dma / 16384.0f * TWO_PI,  // 单圈机械角(全局现算)
+	             theta_multi,                                // 多圈累加角
+	             turns,i_d,i_q);                                     // 圈数
 //	   printf("%.3f,%.3f,%.3f\n", i_d, i_q, theta_e_global);  // d轴电流, q轴电流, 电角度
 //	    printf("%.4f,%.4f,%.4f,%.2f,%.2f,%.2f,%.3f\n",
 //	               (float)angle_raw_dma / 16384.0f * TWO_PI,  // ch0: 真实机械角theta_m
@@ -994,41 +1017,83 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 //                    }
                     // 速度环PI
 //                    iq_ref = PI_Update(&pi_speed, -(omega_ref - omega_e));
+                    // ===== 单圈→多圈累加 =====
+                    float dtheta_m = theta_m - theta_m_last;
+                    if (dtheta_m >  PI) { dtheta_m -= TWO_PI; turns--; }   // 过0→2π边界(倒转)
+                    if (dtheta_m < -PI) { dtheta_m += TWO_PI; turns++; }   // 过2π→0边界(正转)
+                    theta_multi += dtheta_m;        // 累加真实增量
+                    theta_m_last = theta_m;
                     // ===== PLL测速(只为D项阻尼用, 可以重滤波) =====
                     PLL_Update(&pll, theta_m);
+
                     omega_e = pll.omega_hat * POLE_PAIRS;
                     // 给omega_e再加一层重滤波, 专门给D项用(慢没关系)
                     static float omega_filt = 0;
                     omega_filt = 0.9f * omega_filt + 0.1f * omega_e;
+                    // ===== 指令缓动: 中间目标以恒定速率爬向最终目标(匀速运动) =====
+                    float target_err = theta_target_final - theta_target;
+                    if (target_err >  theta_ramp_rate)      theta_target += theta_ramp_rate;
+                    else if (target_err < -theta_ramp_rate) theta_target -= theta_ramp_rate;
+                    else                                    theta_target = theta_target_final;
+                    // ===== 位置环: 多圈角, 误差限幅实现匀速 =====
+                    // ===== 缓动: 中间目标target以恒定速率爬向final(决定回正转速) =====
+                                theta_target = theta_target_final;
 
-                    // ===== 位置环PD → 直接出iq_ref (砍掉速度环) =====
-                    float theta_err = theta_target - theta_m;
-                                        while (theta_err >  PI) theta_err -= TWO_PI;
-                                        while (theta_err < -PI) theta_err += TWO_PI;
+                                        // ===== 位置环: 用完整误差跟踪target(不限幅, 力矩充足) =====
+                                float theta_err = theta_target_final - theta_multi;
 
-                                        static float pos_integral = 0.0f;
+                                float err_max = 0.35f;
+                                float theta_err_sat = theta_err;
+                                if (theta_err_sat >  err_max) theta_err_sat =  err_max;
+                                if (theta_err_sat < -err_max) theta_err_sat = -err_max;
 
-                                        if (theta_err < 0.01f && theta_err > -0.01f) {
-                                            // ★死区内: 冻结输出, 只保留积分保持力矩, 不跑P/D(消抖)
-                                            iq_ref = pos_integral;        // 维持保持力矩, 不响应噪声
-                                        } else {
-                                            // 死区外: 正常PID
-                                            if (theta_err < 0.6f && theta_err > -0.6f) {
-                                                pos_integral += Ki_pos * theta_err;
-                                                if (pos_integral >  0.5f) pos_integral =  0.5f;
-                                                if (pos_integral < -0.5f) pos_integral = -0.5f;
-                                            } else {
-                                                pos_integral = 0.0f;
-                                            }
-                                            iq_ref = Kp_pos * theta_err + pos_integral
-                                                     - Kd_pos * (omega_filt / POLE_PAIRS);
-                                        }
+                                static float pos_integral = 0.0f;
 
-                                        if (iq_ref >  1.5f) iq_ref =  1.5f;
-                                        if (iq_ref < -1.5f) iq_ref = -1.5f;
+                                if (theta_err < 0.01f && theta_err > -0.01f) {
+                                    // 死区: 冻结, 保持力矩
+                                    iq_ref = pos_integral;
+                                } else {
+
+                                        pos_integral += Ki_pos * theta_err_sat;   // ★用限幅误差积分, 防windup
+                                        if (pos_integral >  0.2f) pos_integral =  0.2f;
+                                        if (pos_integral < -0.2f) pos_integral = -0.2f;
+
+                                    iq_ref = Kp_pos * theta_err_sat + pos_integral
+                                             - Kd_pos * (omega_filt / POLE_PAIRS);
+                                }
+
+                                if (iq_ref >  1.5f) iq_ref =  1.5f;
+                                if (iq_ref < -1.5f) iq_ref = -1.5f;
                     // 踢DMA
                     AS5047_ReadAngle_DMA_Kick();
                 }
+    }
+}
+// ===== UART接收完成回调: 逐字符收, 遇\n解析角度 =====
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART2)
+    {
+        if (rx_byte == '\n' || rx_byte == '\r')
+        {
+            // 收到结束符: 解析缓冲区为float
+            if (rx_cmd_idx > 0)
+            {
+                rx_cmd_buf[rx_cmd_idx] = '\0';        // 字符串结尾
+                float val = atof(rx_cmd_buf);          // 字符串→float
+                theta_target_final = val;              // ★写入目标, 电机转过去
+                rx_cmd_idx = 0;                        // 重置缓冲
+            }
+        }
+        else
+        {
+            // 普通字符: 存入缓冲(防溢出)
+            if (rx_cmd_idx < sizeof(rx_cmd_buf) - 1)
+                rx_cmd_buf[rx_cmd_idx++] = rx_byte;
+        }
+
+        // ★关键: 重新启动下一字节接收(否则只收一次)
+        HAL_UART_Receive_IT(&huart2, &rx_byte, 1);
     }
 }
 /* USER CODE END 4 */
