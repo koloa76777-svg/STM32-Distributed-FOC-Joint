@@ -92,15 +92,16 @@
 
 ```
 STM32-Distributed-FOC-Joint/
-├── slave/              # 从板工程:三环 FOC + CAN 接收跟随
-│   └── Core/Src/main.c # 核心代码(FOC运算、中断、CAN回调)
-├── master/             # 主板工程:编码器读取 + CAN 发送目标角
-│   └── Core/Src/main.c
-├── docs/               # 技术文档、调试文档、架构图、演示视频
+├── Core/  Drivers/  *.ioc   # 从板工程(三环 FOC + CAN 接收跟随,位于根目录)
+│   └── Core/Src/main.c      # 从板核心代码(FOC运算、中断、CAN回调)
+├── master/                  # 主板工程(编码器读取 + CAN 发送目标角)
+│   └── Core/Src/main.c      # 主板核心代码
+├── docs/                    # 技术文档、调试文档、架构图、演示视频
+├── LEARNING_LOG.md          # 学习历程
 └── README.md
 ```
 
-主板与从板是两个独立的 STM32CubeIDE 工程,共用同一套 FOC 底层,仅角色不同(主板发送、从板接收执行)。
+主板与从板是两个独立的 STM32CubeIDE 工程,共用同一套 FOC 底层,仅角色不同(主板发送、从板接收执行)。从板工程位于仓库根目录,主板工程位于 master/ 子文件夹。
 
 ### 开发环境
 
