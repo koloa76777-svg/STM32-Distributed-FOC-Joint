@@ -54,6 +54,8 @@
 ADC_HandleTypeDef hadc1;
 DMA_HandleTypeDef hdma_adc1;
 
+CAN_HandleTypeDef hcan1;
+
 SPI_HandleTypeDef hspi1;
 DMA_HandleTypeDef hdma_spi1_rx;
 DMA_HandleTypeDef hdma_spi1_tx;
@@ -139,6 +141,15 @@ float theta_ramp_rate = 0.0001f;    // 每拍爬升步长(rad/拍), 决定转速
 uint8_t rx_byte;                 // 单字节接收
 char rx_cmd_buf[32];             // 命令字符串缓冲
 volatile uint8_t rx_cmd_idx = 0; // 缓冲写指针
+
+// float ↔ 4字节 互转, 用于把CAN数据段还原成角度
+typedef union {
+    float    f;
+    uint8_t  b[4];
+} float_bytes_t;
+
+CAN_RxHeaderTypeDef RxHeader;   // 接收帧头
+uint8_t RxData[8];              // 接收数据缓冲
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -150,6 +161,7 @@ static void MX_TIM3_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_SPI1_Init(void);
 static void MX_ADC1_Init(void);
+static void MX_CAN1_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -406,6 +418,7 @@ int main(void)
   MX_USART2_UART_Init();
   MX_SPI1_Init();
   MX_ADC1_Init();
+  MX_CAN1_Init();
   /* USER CODE BEGIN 2 */
   HAL_Delay(200);          // 等 200ms,让 3.3V/VREF/INA 供电稳定
 
@@ -478,7 +491,7 @@ int main(void)
   HAL_Delay(1);   // 等这帧DMA传回(后台~3µs,给足余量)
 
   {
-      uint16_t raw0 = angle_raw_dma;
+//      uint16_t raw0 = angle_raw_dma;
 //      theta_target = (float)raw0 / 16384.0f * TWO_PI;   // 当前机械角
       theta_target = 0.0f;   // 与theta_multi初值(0)对齐, 上电原地不动
   }
@@ -517,19 +530,23 @@ int main(void)
 //	            theta_e_global, // ch2: 当前电角度
 //	            theta_target - (float)angle_raw_dma/16384.0f*TWO_PI);  // ch3: 位置误差(rad)
 
-	  printf("%.3f,%.3f,%.2f,%.2f,%.2f\n",
-	             (float)angle_raw_dma / 16384.0f * TWO_PI,  // 单圈机械角(全局现算)
-	             theta_multi,                                // 多圈累加角
-	             turns,i_d,i_q);                                     // 圈数
-//	   printf("%.3f,%.3f,%.3f\n", i_d, i_q, theta_e_global);  // d轴电流, q轴电流, 电角度
-//	    printf("%.4f,%.4f,%.4f,%.2f,%.2f,%.2f,%.3f\n",
-//	               (float)angle_raw_dma / 16384.0f * TWO_PI,  // ch0: 真实机械角theta_m
-//	               pll.theta_hat,                              // ch1: PLL估计角theta_hat
-//	               pll.theta_hat - (float)angle_raw_dma / 16384.0f * TWO_PI,  // ch2: 滞后误差(rad)
-//	               pll.omega_hat,omega_ref, omega_e, iq_ref);                             // ch3: PLL机械角速度
+//	  printf("%.3f,%.3f,%.2f,%.2f,%.2f\n",
+//	         (float)angle_raw_dma / 16384.0f * TWO_PI,
+//	         theta_multi,
+//	         (float)turns, i_d, i_q);   // ★turns强转float, 对上%.2f
+////	   printf("%.3f,%.3f,%.3f\n", i_d, i_q, theta_e_global);  // d轴电流, q轴电流, 电角度
+////	    printf("%.4f,%.4f,%.4f,%.2f,%.2f,%.2f,%.3f\n",
+////	               (float)angle_raw_dma / 16384.0f * TWO_PI,  // ch0: 真实机械角theta_m
+////	               pll.theta_hat,                              // ch1: PLL估计角theta_hat
+////	               pll.theta_hat - (float)angle_raw_dma / 16384.0f * TWO_PI,  // ch2: 滞后误差(rad)
+////	               pll.omega_hat,omega_ref, omega_e, iq_ref);                             // ch3: PLL机械角速度
+//	        HAL_Delay(1);
+
+	        printf("%.3f,%.3f,%.3f\n",
+	               theta_target_final,                          // ch0: CAN收到的目标角(主板发来的)
+	               (float)angle_raw_dma / 16384.0f * TWO_PI,    // ch1: 从板当前实际角
+	               theta_multi);                                // ch2: 从板多圈角
 	        HAL_Delay(1);
-
-
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -649,6 +666,72 @@ static void MX_ADC1_Init(void)
   /* USER CODE BEGIN ADC1_Init 2 */
 
   /* USER CODE END ADC1_Init 2 */
+
+}
+
+/**
+  * @brief CAN1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_CAN1_Init(void)
+{
+
+  /* USER CODE BEGIN CAN1_Init 0 */
+
+  /* USER CODE END CAN1_Init 0 */
+
+  /* USER CODE BEGIN CAN1_Init 1 */
+
+  /* USER CODE END CAN1_Init 1 */
+  hcan1.Instance = CAN1;
+  hcan1.Init.Prescaler = 6;
+  hcan1.Init.Mode = CAN_MODE_NORMAL;
+  hcan1.Init.SyncJumpWidth = CAN_SJW_1TQ;
+  hcan1.Init.TimeSeg1 = CAN_BS1_12TQ;
+  hcan1.Init.TimeSeg2 = CAN_BS2_2TQ;
+  hcan1.Init.TimeTriggeredMode = DISABLE;
+  hcan1.Init.AutoBusOff = DISABLE;
+  hcan1.Init.AutoWakeUp = DISABLE;
+  hcan1.Init.AutoRetransmission = DISABLE;
+  hcan1.Init.ReceiveFifoLocked = DISABLE;
+  hcan1.Init.TransmitFifoPriority = DISABLE;
+  if (HAL_CAN_Init(&hcan1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN CAN1_Init 2 */
+  CAN_FilterTypeDef sFilterConfig;   // 滤波器配置结构体
+
+  sFilterConfig.FilterBank           = 0;                       // 用第0组滤波器(单CAN, 0~13都行)
+  sFilterConfig.FilterMode           = CAN_FILTERMODE_IDMASK;   // 掩码模式
+  sFilterConfig.FilterScale          = CAN_FILTERSCALE_32BIT;   // 32位单滤波器(标准帧也用32位最简单)
+
+  sFilterConfig.FilterIdHigh         = 0x101 << 5;   // 放行ID=0x101, 标准ID左移5位到高16位字段
+  sFilterConfig.FilterIdLow          = 0x0000;       // 低16位不用
+  sFilterConfig.FilterMaskIdHigh     = 0x7FF << 5;   // 掩码全1: 11位ID必须完全匹配
+  sFilterConfig.FilterMaskIdLow      = 0x0000;
+
+  sFilterConfig.FilterFIFOAssignment = CAN_RX_FIFO0;  // 命中→塞进FIFO0(对应你勾的RX0中断)
+  sFilterConfig.FilterActivation     = ENABLE;        // 激活本滤波器
+  sFilterConfig.SlaveStartFilterBank = 14;            // CAN1/CAN2分界(单用CAN1, 填14即可)
+
+  if (HAL_CAN_ConfigFilter(&hcan1, &sFilterConfig) != HAL_OK)
+  {
+      Error_Handler();   // 滤波器配置失败→卡死, 方便调试时发现
+  }
+
+  if (HAL_CAN_Start(&hcan1) != HAL_OK)   // 启动CAN, 进入正常通信态
+  {
+      Error_Handler();
+  }
+
+  // 打开"收到报文进FIFO0"的中断通知, 之后报文一到就触发回调
+  if (HAL_CAN_ActivateNotification(&hcan1, CAN_IT_RX_FIFO0_MSG_PENDING) != HAL_OK)
+  {
+      Error_Handler();
+  }
+  /* USER CODE END CAN1_Init 2 */
 
 }
 
@@ -1094,6 +1177,26 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 
         // ★关键: 重新启动下一字节接收(否则只收一次)
         HAL_UART_Receive_IT(&huart2, &rx_byte, 1);
+    }
+}
+
+
+void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
+{
+    if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &RxHeader, RxData) != HAL_OK)
+    {
+        return;
+    }
+
+    if (RxHeader.StdId == 0x101)
+    {
+        float_bytes_t conv;
+        conv.b[0] = RxData[0];
+        conv.b[1] = RxData[1];
+        conv.b[2] = RxData[2];
+        conv.b[3] = RxData[3];
+
+        theta_target_final = conv.f;
     }
 }
 /* USER CODE END 4 */
