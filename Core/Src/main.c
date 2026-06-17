@@ -39,9 +39,17 @@
 #define ADC_RES       4096.0f
 #define INA_GAIN      50.0f
 #define R_SHUNT       0.01f
+
+
+#define I_BASE   1.5f
+#define U_BASE   6.9282f               // = 12 / √3，SVPWM线性区相电压上限
+#define I_BASE_INV   (1.0f / I_BASE)
+
+
 // 码值差 → 安培: (raw - offset) * Vref / 4096 / (Gain * Rshunt)
 #define ADC_TO_AMP(raw, off)  (((float)(raw) - (off)) * ADC_VREF / ADC_RES / (INA_GAIN * R_SHUNT))
 #define POS_DEADBAND  0.05f   // 位置环死区(rad),略大于编码器噪声峰峰
+
 
 /* USER CODE END PD */
 
@@ -125,11 +133,11 @@ float theta_hist[SPEED_WIN] = {0};   // 历史电角度环形缓冲
 volatile uint8_t hist_idx = 0;       // 环形缓冲写指针
 // ===== 位置环参数 =====
 float    theta_target   = 0.0f;    // 目标机械角(rad), 调试时手动改这个看"指哪打哪"
-float    Kp_pos         = 0.8f;    // 位置环P, 先小; 单位(rad/s)/rad
 float    omega_max_mech = 3.0f;    // 机械角ω_ref限幅(rad/s), 防误差大时飞车
-float    Kd_pos = 0.01f;   // 速度阻尼; 单位 A/(rad/s
-float Ki_pos = 0.001f;   // 位置环I, 先很小; 专治卡死/稳态误差
-
+// 标幺化: 电流量纲增益 ÷I_base (×0.6667), 输出从安培变标幺
+float    Kp_pos         = 0.533f;     // 0.8 / 1.5
+float    Kd_pos         = 0.00667f;   // 0.01 / 1.5
+float    Ki_pos         = 0.000667f;  // 0.001 / 1.5
 // ===== 多圈累加角 =====
 float theta_multi = 0.0f;        // 多圈连续机械角(rad), 可超出0~2π
 float theta_m_last = 0.0f;       // 上一拍单圈机械角(检测过零用)
@@ -462,12 +470,12 @@ int main(void)
   Ud_cmd = 0.0f;
   Encoder_Calibrate();  // 强制对齐,测offset
 
-//  printf("offset = %.4f rad\n", theta_offset);  // 打印确认
-  // ★临时:卡在这里反复打印offset,看清了再继续(验证完删掉)
-  pi_id.Kp = 0.5f;  pi_id.Ki = 0.01f;
-  pi_iq.Kp = 0.5f;  pi_iq.Ki = 0.01f;
-  pi_id.out_max = 6.0f;  pi_id.out_min = -6.0f;
-  pi_iq.out_max = 6.0f;  pi_iq.out_min = -6.0f;
+  // 标幺化后等价缩放: Kp_new = Kp_old × (I_base/U_base) = ×0.2165
+  pi_id.Kp = 0.108f;  pi_id.Ki = 0.00217f;
+  pi_iq.Kp = 0.108f;  pi_iq.Ki = 0.00217f;
+
+  pi_id.out_max = 0.95f;  pi_id.out_min = -0.95f;   // 标幺电压限幅，留5%余量防过调制
+  pi_iq.out_max = 0.95f;  pi_iq.out_min = -0.95f;
   pi_id.integral = 0;  pi_iq.integral = 0;
   // ★Step2: 开控制中断前,先踢一帧DMA"预热"
   //   否则第一拍中断读 angle_raw_dma 还是0(没人踢过),θe会是无效值
@@ -1042,11 +1050,20 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
         i_q = -i_alpha * s + i_beta * c;
         delta_theta_dbg = atan2f(i_d, i_q);   // 反电动势法: 这个值=Δθ,对齐好应恒定
         // 电流环PI
+
+        // ===== 转换点①：物理电流(A) → 标幺电流(pu) =====
+        float id_pu = i_d * I_BASE_INV;
+        float iq_pu = i_q * I_BASE_INV;
+        float iq_ref_pu = iq_ref ;   // iq_ref暂仍是物理安培，进环口转标幺(过渡)
         float Ud = PI_Update(&pi_id, 0.0f   - i_d);   // id_ref=0
         float Uq = PI_Update(&pi_iq, iq_ref - i_q);   // iq_ref=指令
 
-        float Ualpha = Ud * c - Uq * s;    // ★用Ud/Uq,不是Ud_cmd/Uq_cmd
-        float Ubeta  = Ud * s + Uq * c;
+        // ===== 转换点②：标幺电压(pu) → 物理电压(V) =====
+        float Ud_v = Ud * U_BASE;
+        float Uq_v = Uq * U_BASE;
+
+        float Ualpha = Ud_v * c - Uq_v * s;
+        float Ubeta  = Ud_v * s + Uq_v * c;
         Ua_dbg = Ualpha;   // 临时:看逆Park输出
         Ub_dbg = Ubeta;
         SVPWM(Ualpha, Ubeta);
@@ -1136,17 +1153,16 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
                                     // 死区: 冻结, 保持力矩
                                     iq_ref = pos_integral;
                                 } else {
+                                    pos_integral += Ki_pos * theta_err_sat;   // ★用限幅误差积分, 防windup
+                                    if (pos_integral >  0.1333f) pos_integral =  0.1333f;   // 0.2/1.5
+                                    if (pos_integral < -0.1333f) pos_integral = -0.1333f;
 
-                                        pos_integral += Ki_pos * theta_err_sat;   // ★用限幅误差积分, 防windup
-                                        if (pos_integral >  0.2f) pos_integral =  0.2f;
-                                        if (pos_integral < -0.2f) pos_integral = -0.2f;
+                                iq_ref = Kp_pos * theta_err_sat + pos_integral
+                                         - Kd_pos * (omega_filt / POLE_PAIRS);
+                            }
 
-                                    iq_ref = Kp_pos * theta_err_sat + pos_integral
-                                             - Kd_pos * (omega_filt / POLE_PAIRS);
-                                }
-
-                                if (iq_ref >  1.5f) iq_ref =  1.5f;
-                                if (iq_ref < -1.5f) iq_ref = -1.5f;
+                            if (iq_ref >  1.0f) iq_ref =  1.0f;   // 1.5/1.5 = 标幺满量程
+                            if (iq_ref < -1.0f) iq_ref = -1.0f;
                     // 踢DMA
                     AS5047_ReadAngle_DMA_Kick();
                 }
