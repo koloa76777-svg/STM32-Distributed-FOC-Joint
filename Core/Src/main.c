@@ -158,6 +158,20 @@ typedef union {
 
 CAN_RxHeaderTypeDef RxHeader;   // 接收帧头
 uint8_t RxData[8];              // 接收数据缓冲
+
+// ===== 控制模式 =====
+typedef enum { MODE_POSITION = 0, MODE_TORQUE = 1 } ControlMode_t;
+volatile ControlMode_t control_mode = MODE_POSITION;   // 默认位置模式
+volatile float torque_ref = 0.0f;   // 外部力矩指令(标幺, 范围-1.0~1.0, 对应±1.5A的iq)
+
+volatile float pos_integral = 0.0f;   // 位置环积分(提全局, 供模式切换清零)
+
+volatile uint32_t rx_irq_count = 0;   // RX中断进入次数(调试)
+volatile char last_cmd_char = 0;     // 加到 PV 区
+volatile uint8_t last_cmd_len = 0;
+volatile uint8_t rx_byte_dbg = 0;   // 抓每个进中断的原始字节
+volatile float Kff = 0.0f;   // 反电势前馈增益, 先0(基准), debug里调
+volatile float Uq_ff_dbg = 0.0f;  // 前馈量, 调试看
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -389,6 +403,32 @@ void PLL_Update(PLL_Observer *p, float theta_m)
     if (p->theta_hat <  0)      p->theta_hat += TWO_PI;
 }
 // 平滑速度取 p->omega_hat (机械角速度), ×POLE_PAIRS 得电角速度
+
+
+/**
+ * @brief 切换控制模式, 并清理切换瞬间的隐患
+ * @param new_mode  MODE_POSITION 或 MODE_TORQUE
+ *
+ * 切换动作(无论往哪切都做):
+ *   1. iq_ref 清零 → 切换瞬间不出力, 避免旧指令残留导致跳变
+ *   2. pos_integral 清零 → 防止位置环积分windup(力矩模式期间冻结的旧积分)
+ *   3. torque_ref 清零 → 切到力矩模式时从0开始, 防上一次的力矩值突然加上
+ */
+void SetControlMode(ControlMode_t new_mode)
+{
+    iq_ref       = 0.0f;
+    pos_integral = 0.0f;
+    torque_ref   = 0.0f;
+    pi_speed.integral = 0.0f;   // ★加这行:清速度环积分,防切入瞬间跳变
+    if (new_mode == MODE_POSITION)
+    {
+        // 切回位置模式: 把目标设成当前实际位置, 避免"指哪打哪"瞬间猛冲
+        theta_target_final = theta_multi;
+        theta_target       = theta_multi;
+    }
+
+    control_mode = new_mode;   // 最后才改模式, 前面的清零先生效
+}
 /* USER CODE END 0 */
 
 /**
@@ -482,8 +522,8 @@ int main(void)
   // ===== 速度环参数(初始化跑一次,别放while里) =====
   pi_speed.Kp = 0.001f;
   pi_speed.Ki = 0.0001f;
-  pi_speed.out_max =  1.5f;
-  pi_speed.out_min = -1.5f;
+  pi_speed.out_max =  1.0f;
+  pi_speed.out_min = -1.0f;
   pi_speed.integral = 0;
   //   预热后第一拍就有真实角度可取,流水线立即满载
 
@@ -549,12 +589,17 @@ int main(void)
 ////	               pll.theta_hat - (float)angle_raw_dma / 16384.0f * TWO_PI,  // ch2: 滞后误差(rad)
 ////	               pll.omega_hat,omega_ref, omega_e, iq_ref);                             // ch3: PLL机械角速度
 //	        HAL_Delay(1);
+      printf("%.1f,%.1f,%.3f,%.3f\n",
+             omega_ref,   // ch0: 目标电角速度
+             omega_e,     // ch1: 实际电角速度(PLL)
+             i_d,         // ch2: d轴电流
+             i_q);        // ch3: q轴电流
 
-	        printf("%.3f,%.3f,%.3f\n",
-	               theta_target_final,                          // ch0: CAN收到的目标角(主板发来的)
-	               (float)angle_raw_dma / 16384.0f * TWO_PI,    // ch1: 从板当前实际角
-	               theta_multi);                                // ch2: 从板多圈角
-	        HAL_Delay(1);
+//	        printf("%.3f,%.3f,%.3f,%.3f,%.3f\n",
+//	               theta_target_final,                          // ch0: CAN收到的目标角(主板发来的)
+//	               (float)angle_raw_dma / 16384.0f * TWO_PI,    // ch1: 从板当前实际角
+//	               theta_multi,i_d,i_q);                                // ch2: 从板多圈角
+	        HAL_Delay(10);
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -1054,10 +1099,13 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
         // ===== 转换点①：物理电流(A) → 标幺电流(pu) =====
         float id_pu = i_d * I_BASE_INV;
         float iq_pu = i_q * I_BASE_INV;
-        float iq_ref_pu = iq_ref ;   // iq_ref暂仍是物理安培，进环口转标幺(过渡)
-        float Ud = PI_Update(&pi_id, 0.0f   - i_d);   // id_ref=0
-        float Uq = PI_Update(&pi_iq, iq_ref - i_q);   // iq_ref=指令
-
+        float Ud = PI_Update(&pi_id, 0.0f    - id_pu);   // 新:标幺 − 标幺
+        float Uq = PI_Update(&pi_iq, iq_ref  - iq_pu);   // 新:标幺 − 标幺
+        float Uq_ff = Kff * omega_e;     // 反电势前馈(标幺)
+        Uq_ff_dbg = Uq_ff;
+        Uq = Uq + Uq_ff;
+        if (Uq >  0.95f) Uq =  0.95f;
+        if (Uq < -0.95f) Uq = -0.95f;
         // ===== 转换点②：标幺电压(pu) → 物理电压(V) =====
         float Ud_v = Ud * U_BASE;
         float Uq_v = Uq * U_BASE;
@@ -1136,6 +1184,15 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
                     else if (target_err < -theta_ramp_rate) theta_target -= theta_ramp_rate;
                     else                                    theta_target = theta_target_final;
                     // ===== 位置环: 多圈角, 误差限幅实现匀速 =====
+
+                    if (control_mode == MODE_TORQUE)
+                    {
+                        // ===== 力矩模式: 外部指令直接给 iq_ref(标幺) =====
+                        iq_ref = torque_ref;
+//                        iq_ref = PI_Update(&pi_speed, omega_ref - omega_e);
+                    }
+                    else
+                    {
                     // ===== 缓动: 中间目标target以恒定速率爬向final(决定回正转速) =====
                                 theta_target = theta_target_final;
 
@@ -1147,11 +1204,12 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
                                 if (theta_err_sat >  err_max) theta_err_sat =  err_max;
                                 if (theta_err_sat < -err_max) theta_err_sat = -err_max;
 
-                                static float pos_integral = 0.0f;
+
 
                                 if (theta_err < 0.01f && theta_err > -0.01f) {
                                     // 死区: 冻结, 保持力矩
                                     iq_ref = pos_integral;
+
                                 } else {
                                     pos_integral += Ki_pos * theta_err_sat;   // ★用限幅误差积分, 防windup
                                     if (pos_integral >  0.1333f) pos_integral =  0.1333f;   // 0.2/1.5
@@ -1160,7 +1218,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
                                 iq_ref = Kp_pos * theta_err_sat + pos_integral
                                          - Kd_pos * (omega_filt / POLE_PAIRS);
                             }
-
+                    }
                             if (iq_ref >  1.0f) iq_ref =  1.0f;   // 1.5/1.5 = 标幺满量程
                             if (iq_ref < -1.0f) iq_ref = -1.0f;
                     // 踢DMA
@@ -1172,25 +1230,44 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
     if (huart->Instance == USART2)
-    {
+    {rx_irq_count++;
+    rx_byte_dbg = rx_byte;   // ★抓原始字节值
         if (rx_byte == '\n' || rx_byte == '\r')
         {
-            // 收到结束符: 解析缓冲区为float
-            if (rx_cmd_idx > 0)
-            {
-                rx_cmd_buf[rx_cmd_idx] = '\0';        // 字符串结尾
-                float val = atof(rx_cmd_buf);          // 字符串→float
-                theta_target_final = val;              // ★写入目标, 电机转过去
-                rx_cmd_idx = 0;                        // 重置缓冲
-            }
+        	if (rx_cmd_idx > 0)
+        	{
+        	    rx_cmd_buf[rx_cmd_idx] = '\0';
+        	    last_cmd_char = rx_cmd_buf[0];   // ★抓首字符
+        	    last_cmd_len  = rx_cmd_idx;      // ★抓长度
+        	    // ===== 命令解析: 单字符命令 vs 数字 =====
+        	    if (rx_cmd_buf[0] == 'P' || rx_cmd_buf[0] == 'p')
+        	    {
+        	        SetControlMode(MODE_POSITION);     // 发 "P" → 位置模式
+        	    }
+        	    else if (rx_cmd_buf[0] == 'T' || rx_cmd_buf[0] == 't')
+        	    {
+        	        SetControlMode(MODE_TORQUE);       // 发 "T" → 力矩模式
+        	    }
+        	    else
+        	    {
+        	        // 纯数字: 按当前模式分发
+        	        float val = atof(rx_cmd_buf);
+        	        if (control_mode == MODE_TORQUE)
+        	            torque_ref = val;              // 力矩模式: 数字 = 力矩指令(标幺)
+//        	            omega_ref = val;   // 临时: 数字=目标转速
+
+        	        else
+        	            theta_target_final = val;      // 位置模式: 数字 = 目标角(rad)
+        	    }
+
+        	    rx_cmd_idx = 0;
+        	}
         }
-        else
+        else   // ★加回这个分支:普通字符存进buffer
         {
-            // 普通字符: 存入缓冲(防溢出)
             if (rx_cmd_idx < sizeof(rx_cmd_buf) - 1)
                 rx_cmd_buf[rx_cmd_idx++] = rx_byte;
         }
-
         // ★关键: 重新启动下一字节接收(否则只收一次)
         HAL_UART_Receive_IT(&huart2, &rx_byte, 1);
     }
