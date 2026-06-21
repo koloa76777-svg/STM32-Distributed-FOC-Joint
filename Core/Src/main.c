@@ -50,7 +50,10 @@
 #define ADC_TO_AMP(raw, off)  (((float)(raw) - (off)) * ADC_VREF / ADC_RES / (INA_GAIN * R_SHUNT))
 #define POS_DEADBAND  0.05f   // 位置环死区(rad),略大于编码器噪声峰峰
 
-
+// ===== 堵转检测参数 =====
+#define STALL_IQ_THRESH    1.0f     // 电流阈值(标幺): |i_q标幺|超过算"在使劲"
+#define STALL_MOVE_THRESH  0.01f    // 位置变化阈值(rad): N拍内变化小于此算"没动"
+#define STALL_COUNT_MAX    50       // 持续拍数: 连续满足这么多次才判堵转(50×~0.5ms≈25ms)
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -170,8 +173,13 @@ volatile uint32_t rx_irq_count = 0;   // RX中断进入次数(调试)
 volatile char last_cmd_char = 0;     // 加到 PV 区
 volatile uint8_t last_cmd_len = 0;
 volatile uint8_t rx_byte_dbg = 0;   // 抓每个进中断的原始字节
-volatile float Kff = 0.0f;   // 反电势前馈增益, 先0(基准), debug里调
+volatile float Kff = 0.0003f;   // 反电势前馈增益, 先0(基准), debug里调
 volatile float Uq_ff_dbg = 0.0f;  // 前馈量, 调试看
+
+// ===== 堵转检测状态 =====
+volatile uint8_t  stall_flag = 0;        // 堵转标志: 1=检测到堵转
+volatile uint16_t stall_counter = 0;     // 连续满足条件的计数
+float    theta_multi_last_stall = 0.0f;  // 上次检测时的多圈角(算变化用)
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -589,12 +597,21 @@ int main(void)
 ////	               pll.theta_hat - (float)angle_raw_dma / 16384.0f * TWO_PI,  // ch2: 滞后误差(rad)
 ////	               pll.omega_hat,omega_ref, omega_e, iq_ref);                             // ch3: PLL机械角速度
 //	        HAL_Delay(1);
-      printf("%.1f,%.1f,%.3f,%.3f\n",
-             omega_ref,   // ch0: 目标电角速度
-             omega_e,     // ch1: 实际电角速度(PLL)
-             i_d,         // ch2: d轴电流
-             i_q);        // ch3: q轴电流
-
+//      printf("%.1f,%.1f,%.3f,%.3f\n",
+//             omega_ref,   // ch0: 目标电角速度
+//             omega_e,     // ch1: 实际电角速度(PLL)
+//             i_d,         // ch2: d轴电流
+//             i_q);        // ch3: q轴电流
+//    		  printf("%.2f,%.1f,%.3f,%.3f\n",
+//    		               theta_multi,                    // ch0: 多圈累加角(rad)
+//    		               theta_multi * 0.7958f,          // ch1: 换算位移(mm), =theta_multi/(2π)×5
+//    		               (float)turns,                   // ch2: 圈数(整数, 强转float对齐格式)
+//    		               i_q);                           // ch3: q轴电流(A), 看推力够不够
+	  printf("%.2f,%.1f,%.3f,%.1f\n",
+	               theta_multi,                    // ch0: 多圈角(rad)
+	               i_q,                            // ch1: q轴电流(A), 看使劲没
+	               theta_multi * 0.7958f,          // ch2: 位移(mm)
+	               (float)stall_flag);             // ch3: 堵转标志(0/1), 撞挡块应跳1
 //	        printf("%.3f,%.3f,%.3f,%.3f,%.3f\n",
 //	               theta_target_final,                          // ch0: CAN收到的目标角(主板发来的)
 //	               (float)angle_raw_dma / 16384.0f * TWO_PI,    // ch1: 从板当前实际角
@@ -1165,12 +1182,35 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 //                    }
                     // 速度环PI
 //                    iq_ref = PI_Update(&pi_speed, -(omega_ref - omega_e));
+
                     // ===== 单圈→多圈累加 =====
                     float dtheta_m = theta_m - theta_m_last;
                     if (dtheta_m >  PI) { dtheta_m -= TWO_PI; turns--; }   // 过0→2π边界(倒转)
                     if (dtheta_m < -PI) { dtheta_m += TWO_PI; turns++; }   // 过2π→0边界(正转)
                     theta_multi += dtheta_m;        // 累加真实增量
                     theta_m_last = theta_m;
+                    // ===== 堵转检测(纯观测, 不动作) =====
+                    // 判据: i_q在使劲(电流大) 且 theta_multi几乎没动 → 累加计数
+                    float iq_pu_abs = i_q * I_BASE_INV;       // i_q转标幺
+                    if (iq_pu_abs < 0) iq_pu_abs = -iq_pu_abs; // 取绝对值
+
+                    float dmulti = theta_multi - theta_multi_last_stall;
+                    if (dmulti < 0) dmulti = -dmulti;          // 位置变化绝对值
+
+                    if (iq_pu_abs > STALL_IQ_THRESH && dmulti < STALL_MOVE_THRESH)
+                    {
+                        // 使劲了但没动 → 计数++
+                        if (stall_counter < STALL_COUNT_MAX) stall_counter++;
+                        if (stall_counter >= STALL_COUNT_MAX) stall_flag = 1;   // 持续够久 → 判堵转
+                    }
+                    else
+                    {
+                        // 任一条件不满足(没使劲 或 动了) → 计数清零, 解除标志
+                        stall_counter = 0;
+                        stall_flag = 0;
+                        theta_multi_last_stall = theta_multi;   // ★加这行: 没堵转时, 基准跟着当前位置走
+                    }
+
                     // ===== PLL测速(只为D项阻尼用, 可以重滤波) =====
                     PLL_Update(&pll, theta_m);
 
@@ -1219,8 +1259,8 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
                                          - Kd_pos * (omega_filt / POLE_PAIRS);
                             }
                     }
-                            if (iq_ref >  1.0f) iq_ref =  1.0f;   // 1.5/1.5 = 标幺满量程
-                            if (iq_ref < -1.0f) iq_ref = -1.0f;
+                            if (iq_ref >  2.0f) iq_ref =  2.0f;   // 1.5/1.5 = 标幺满量程
+                            if (iq_ref < -2.0f) iq_ref = -2.0f;
                     // 踢DMA
                     AS5047_ReadAngle_DMA_Kick();
                 }
