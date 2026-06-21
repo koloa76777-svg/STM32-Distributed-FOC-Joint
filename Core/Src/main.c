@@ -29,7 +29,13 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-
+// ===== 回零状态机 =====
+typedef enum {
+    HOMING_IDLE = 0,    // 未回零(正常工作)
+    HOMING_SEARCH,      // 搜索静摩擦突破点
+    HOMING_CRUISE,      // 降力矩巡航向挡块
+    HOMING_DONE         // 回零完成
+} HomingState_t;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -51,9 +57,14 @@
 #define POS_DEADBAND  0.05f   // 位置环死区(rad),略大于编码器噪声峰峰
 
 // ===== 堵转检测参数 =====
-#define STALL_IQ_THRESH    1.0f     // 电流阈值(标幺): |i_q标幺|超过算"在使劲"
+#define STALL_IQ_THRESH    0.7f     // 电流阈值(标幺): |i_q标幺|超过算"在使劲"
 #define STALL_MOVE_THRESH  0.01f    // 位置变化阈值(rad): N拍内变化小于此算"没动"
 #define STALL_COUNT_MAX    50       // 持续拍数: 连续满足这么多次才判堵转(50×~0.5ms≈25ms)
+
+#define HOMING_TORQUE_RAMP   0.002f   // 力矩每拍爬升步长(标幺), 朝负方向
+#define HOMING_TORQUE_MAX    1.5f     // 力矩上限(标幺), 爬到这还没突破=异常
+#define HOMING_BREAK_MOVE    0.5f     // 突破判据: 累积位移超此值(rad)算动了
+#define HOMING_HOLD_MAX   5000    // 力矩到上限后, 顶住的拍数(400×0.5ms≈200ms)
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -180,6 +191,13 @@ volatile float Uq_ff_dbg = 0.0f;  // 前馈量, 调试看
 volatile uint8_t  stall_flag = 0;        // 堵转标志: 1=检测到堵转
 volatile uint16_t stall_counter = 0;     // 连续满足条件的计数
 float    theta_multi_last_stall = 0.0f;  // 上次检测时的多圈角(算变化用)
+
+// ===== 回零状态机 =====
+volatile HomingState_t homing_state = HOMING_IDLE;   // 当前回零状态
+volatile float homing_torque = 0.0f;                 // 回零过程的力矩输出
+float homing_t_break = 0.0f;                          // 记录的突破力矩
+float homing_start_pos = 0.0f;   // SEARCH起点位置(算突破位移用)
+volatile uint16_t homing_hold_counter = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -607,11 +625,16 @@ int main(void)
 //    		               theta_multi * 0.7958f,          // ch1: 换算位移(mm), =theta_multi/(2π)×5
 //    		               (float)turns,                   // ch2: 圈数(整数, 强转float对齐格式)
 //    		               i_q);                           // ch3: q轴电流(A), 看推力够不够
-	  printf("%.2f,%.1f,%.3f,%.1f\n",
-	               theta_multi,                    // ch0: 多圈角(rad)
-	               i_q,                            // ch1: q轴电流(A), 看使劲没
-	               theta_multi * 0.7958f,          // ch2: 位移(mm)
-	               (float)stall_flag);             // ch3: 堵转标志(0/1), 撞挡块应跳1
+//	  printf("%.2f,%.1f,%.3f,%.1f\n",
+//	               theta_multi,                    // ch0: 多圈角(rad)
+//	               i_q,                            // ch1: q轴电流(A), 看使劲没
+//	               theta_multi * 0.7958f,          // ch2: 位移(mm)
+//	               (float)stall_flag);             // ch3: 堵转标志(0/1), 撞挡块应跳1
+	  printf("%.2f,%.1f,%.1f,%.1f\n",
+	  	               theta_multi,                    // ch0: 多圈角(rad)
+	  	               i_q,                            // ch1: q轴电流(A)
+	  	               (float)stall_flag,              // ch2: 堵转标志
+	  	               (float)homing_state);           // ch3: 回零状态(0=IDLE,1=SEARCH,2=CRUISE,3=DONE)
 //	        printf("%.3f,%.3f,%.3f,%.3f,%.3f\n",
 //	               theta_target_final,                          // ch0: CAN收到的目标角(主板发来的)
 //	               (float)angle_raw_dma / 16384.0f * TWO_PI,    // ch1: 从板当前实际角
@@ -1224,7 +1247,71 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
                     else if (target_err < -theta_ramp_rate) theta_target -= theta_ramp_rate;
                     else                                    theta_target = theta_target_final;
                     // ===== 位置环: 多圈角, 误差限幅实现匀速 =====
+                    // ===== 回零状态机(骨架, 逻辑后填) =====
+                                        switch (homing_state)
+                                        {
+                                        case HOMING_SEARCH:
+                                            // ① 力矩缓慢爬升(朝负方向=挡块方向)
+                                            homing_torque -= HOMING_TORQUE_RAMP;
+                                            if (homing_torque < -HOMING_TORQUE_MAX)
+                                                homing_torque = -HOMING_TORQUE_MAX;   // 限幅
 
+                                            // ② 检测突破: 累积位移超阈值 = 滑块动了
+                                            float move = theta_multi - homing_start_pos;
+                                            if (move < 0) move = -move;
+                                            if (move > HOMING_BREAK_MOVE)
+                                            {
+                                                homing_t_break = homing_torque;   // 记录突破力矩
+                                                homing_state = HOMING_CRUISE;     // 转巡航
+                                            }
+
+                                            // ③ 力矩到上限: 不立刻退出, 先顶住一段时间给机会突破
+                                            if (homing_torque <= -HOMING_TORQUE_MAX)
+                                            {
+                                                homing_hold_counter++;
+                                                if (homing_hold_counter >= HOMING_HOLD_MAX)
+                                                {
+                                                    // 顶住够久还没突破 → 真的推不动, 退出
+                                                    homing_torque = 0.0f;
+                                                    homing_hold_counter = 0;
+                                                    homing_state = HOMING_IDLE;
+                                                }
+                                            }
+
+
+                                            // ★把回零力矩输出给 torque_ref(让电机真的动)
+                                            torque_ref = homing_torque;
+                                            break;
+
+                                            case HOMING_CRUISE:
+                                                // TODO: 降力矩巡航, 撞挡块(stall_flag) → 转DONE
+                                                // ① 降力矩: 突破后用突破力矩的60%, 防止加速狂奔
+                                                torque_ref = homing_t_break * 0.6f;
+
+                                                // ② 撞挡块检测: 堵转标志触发 → 回零完成
+                                                if (stall_flag)
+                                                {
+                                                    homing_state = HOMING_DONE;
+                                                }
+                                                break;
+
+                                            case HOMING_DONE:
+                                                // 回零完成: 设零点, 切位置模式
+                                                theta_multi = 0.0f;
+                                                theta_multi_last_stall = 0.0f;
+                                                theta_target_final = 0.0f;
+                                                homing_torque = 0.0f;
+                                                torque_ref = 0.0f;            // ★加: 停力矩, 别再顶挡块
+                                                stall_flag = 0;               // ★加: 清堵转标志
+                                                stall_counter = 0;
+                                                homing_state = HOMING_IDLE;   // 回到IDLE
+                                                // 注: 这里先不切位置模式, 框架阶段保持力矩模式观察
+                                                break;
+
+                                            case HOMING_IDLE:
+                                            default:
+                                                break;
+                                        }
                     if (control_mode == MODE_TORQUE)
                     {
                         // ===== 力矩模式: 外部指令直接给 iq_ref(标幺) =====
@@ -1287,6 +1374,13 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
         	    else if (rx_cmd_buf[0] == 'T' || rx_cmd_buf[0] == 't')
         	    {
         	        SetControlMode(MODE_TORQUE);       // 发 "T" → 力矩模式
+        	    }
+        	    else if (rx_cmd_buf[0] == 'H' || rx_cmd_buf[0] == 'h')   // ★新增
+        	    {
+        	        SetControlMode(MODE_TORQUE);       // 回零在力矩模式下做
+        	        homing_state = HOMING_SEARCH;      // 启动回零状态机
+        	        homing_torque = 0.0f;              // 力矩从0开始爬
+        	        homing_start_pos = theta_multi;   // 记下回零起点
         	    }
         	    else
         	    {
