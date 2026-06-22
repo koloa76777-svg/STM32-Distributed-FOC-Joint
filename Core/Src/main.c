@@ -65,6 +65,10 @@ typedef enum {
 #define HOMING_TORQUE_MAX    1.5f     // 力矩上限(标幺), 爬到这还没突破=异常
 #define HOMING_BREAK_MOVE    0.5f     // 突破判据: 累积位移超此值(rad)算动了
 #define HOMING_HOLD_MAX   5000    // 力矩到上限后, 顶住的拍数(400×0.5ms≈200ms)
+
+// ===== 软件位置限位(回零后坐标: 挡块=0, 向左为正) =====
+#define POS_LIMIT_MIN   0.0f     // 下限(rad), 挡块内侧留~4mm余量
+#define POS_LIMIT_MAX   185.0f   // 上限(rad), 左端留余量(左端开放无挡块!)
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -149,9 +153,9 @@ volatile uint8_t hist_idx = 0;       // 环形缓冲写指针
 float    theta_target   = 0.0f;    // 目标机械角(rad), 调试时手动改这个看"指哪打哪"
 float    omega_max_mech = 3.0f;    // 机械角ω_ref限幅(rad/s), 防误差大时飞车
 // 标幺化: 电流量纲增益 ÷I_base (×0.6667), 输出从安培变标幺
-float    Kp_pos         = 0.533f;     // 0.8 / 1.5
-float    Kd_pos         = 0.00667f;   // 0.01 / 1.5
-float    Ki_pos         = 0.000667f;  // 0.001 / 1.5
+float    Kp_pos         = 0.2f;     // 0.8 / 1.5
+float    Kd_pos         = 0.005f;   // 0.01 / 1.5
+float    Ki_pos         = 0.0002f;  // 0.001 / 1.5
 // ===== 多圈累加角 =====
 float theta_multi = 0.0f;        // 多圈连续机械角(rad), 可超出0~2π
 float theta_m_last = 0.0f;       // 上一拍单圈机械角(检测过零用)
@@ -175,7 +179,7 @@ uint8_t RxData[8];              // 接收数据缓冲
 
 // ===== 控制模式 =====
 typedef enum { MODE_POSITION = 0, MODE_TORQUE = 1 } ControlMode_t;
-volatile ControlMode_t control_mode = MODE_POSITION;   // 默认位置模式
+volatile ControlMode_t control_mode = MODE_TORQUE;   // 改: 上电默认力矩模式
 volatile float torque_ref = 0.0f;   // 外部力矩指令(标幺, 范围-1.0~1.0, 对应±1.5A的iq)
 
 volatile float pos_integral = 0.0f;   // 位置环积分(提全局, 供模式切换清零)
@@ -630,11 +634,17 @@ int main(void)
 //	               i_q,                            // ch1: q轴电流(A), 看使劲没
 //	               theta_multi * 0.7958f,          // ch2: 位移(mm)
 //	               (float)stall_flag);             // ch3: 堵转标志(0/1), 撞挡块应跳1
-	  printf("%.2f,%.1f,%.1f,%.1f\n",
-	  	               theta_multi,                    // ch0: 多圈角(rad)
-	  	               i_q,                            // ch1: q轴电流(A)
-	  	               (float)stall_flag,              // ch2: 堵转标志
-	  	               (float)homing_state);           // ch3: 回零状态(0=IDLE,1=SEARCH,2=CRUISE,3=DONE)
+//	  printf("%.2f,%.1f,%.1f,%.1f\n",
+//	  	               theta_multi,                    // ch0: 多圈角(rad)
+//	  	               i_q,                            // ch1: q轴电流(A)
+//	  	               (float)stall_flag,              // ch2: 堵转标志
+//	  	               (float)homing_state);           // ch3: 回零状态(0=IDLE,1=SEARCH,2=CRUISE,3=DONE)
+	  printf("%.2f,%.1f,%.1f,%.1f,%.1f\n",
+	  	  	               theta_multi,                    //实际角度
+						   theta_target_final,             //目标角度
+						   theta_target_final * 0.7958f,// 目标位置(mm)
+						   theta_multi * 0.7958f,//  实际位置(mm)
+	  	  	               iq_ref);           // 力矩
 //	        printf("%.3f,%.3f,%.3f,%.3f,%.3f\n",
 //	               theta_target_final,                          // ch0: CAN收到的目标角(主板发来的)
 //	               (float)angle_raw_dma / 16384.0f * TWO_PI,    // ch1: 从板当前实际角
@@ -1316,38 +1326,51 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
                     {
                         // ===== 力矩模式: 外部指令直接给 iq_ref(标幺) =====
                         iq_ref = torque_ref;
-//                        iq_ref = PI_Update(&pi_speed, omega_ref - omega_e);
+                        // ===== 力矩模式软件限位: 到边界时禁止继续往界外使力 =====
+                        // (回零SEARCH/CRUISE期间不限, 否则回零撞不了挡块)
+                        if (homing_state == HOMING_IDLE)
+                        {
+                            // 已到上限(左端) 且 还想往左(正iq) → 禁止
+                            if (theta_multi > POS_LIMIT_MAX && iq_ref > 0.0f)
+                                iq_ref = 0.0f;
+                            // 已到下限(挡块) 且 还想往右(负iq) → 禁止
+                            if (theta_multi < POS_LIMIT_MIN && iq_ref < 0.0f)
+                                iq_ref = 0.0f;
+                        }
                     }
                     else
                     {
+                        // ===== 位置模式软件限位: clamp目标在安全行程内 =====
+                          if (theta_target_final > POS_LIMIT_MAX) theta_target_final = POS_LIMIT_MAX;
+                          if (theta_target_final < POS_LIMIT_MIN) theta_target_final = POS_LIMIT_MIN;
                     // ===== 缓动: 中间目标target以恒定速率爬向final(决定回正转速) =====
                                 theta_target = theta_target_final;
 
                                         // ===== 位置环: 用完整误差跟踪target(不限幅, 力矩充足) =====
                                 float theta_err = theta_target_final - theta_multi;
 
-                                float err_max = 0.35f;
+                                float err_max = 5.0f;
                                 float theta_err_sat = theta_err;
                                 if (theta_err_sat >  err_max) theta_err_sat =  err_max;
                                 if (theta_err_sat < -err_max) theta_err_sat = -err_max;
 
 
 
-                                if (theta_err < 0.01f && theta_err > -0.01f) {
+                                if (theta_err < 0.6f && theta_err > -0.6f) {
                                     // 死区: 冻结, 保持力矩
-                                    iq_ref = pos_integral;
+                                    iq_ref = 0;
 
                                 } else {
                                     pos_integral += Ki_pos * theta_err_sat;   // ★用限幅误差积分, 防windup
-                                    if (pos_integral >  0.1333f) pos_integral =  0.1333f;   // 0.2/1.5
-                                    if (pos_integral < -0.1333f) pos_integral = -0.1333f;
+                                    if (pos_integral >  1.0f) pos_integral =  1.0f;   // 0.2/1.5
+                                    if (pos_integral < -1.0f) pos_integral = -1.0f;
 
                                 iq_ref = Kp_pos * theta_err_sat + pos_integral
                                          - Kd_pos * (omega_filt / POLE_PAIRS);
                             }
                     }
-                            if (iq_ref >  2.0f) iq_ref =  2.0f;   // 1.5/1.5 = 标幺满量程
-                            if (iq_ref < -2.0f) iq_ref = -2.0f;
+                            if (iq_ref >  1.5f) iq_ref =  1.5f;   // 1.5/1.5 = 标幺满量程
+                            if (iq_ref < -1.5f) iq_ref = -1.5f;
                     // 踢DMA
                     AS5047_ReadAngle_DMA_Kick();
                 }
